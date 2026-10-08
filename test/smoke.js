@@ -44,7 +44,7 @@ let n = 0; const ok = name => console.log(`  ok ${++n} ${name}`);
 
   b.send({ t: 'move', x: 99, z: -99, ry: 0, mv: true }); await sleep(250);
   const last = a.got.filter(m => m.t === 'state').pop().p.find(r => r[0] === joinB.p.id);
-  assert(Math.abs(last[1]) <= 5.56 && Math.abs(last[2]) <= 5.56); ok('positions stay inside the island');
+  assert(Math.abs(last[1]) <= 7.76 && Math.abs(last[2]) <= 7.76); ok('positions stay inside the town');
   a.send({ t: 'move', x: 0.5, z: 1.9, ry: 0, mv: false }); await sleep(120);
   for (let i = 0; i < 4; i++) { a.send({ t: 'move', x: -5, z: -5, ry: 0, mv: true }); await sleep(30); }
   await a.wait(m => m.t === 'snap'); ok('teleporting gets the client snapped back');

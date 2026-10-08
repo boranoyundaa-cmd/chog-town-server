@@ -22,7 +22,7 @@ const CFG = {
   rpc: process.env.RPC_URL || 'https://rpc.monad.xyz',
   nft: (process.env.NFT_ADDR || '0xc96d31f8626c6d03fae5dcd3d61e3fb9f4a73763').toLowerCase(),
   origins: (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean),   // empty = any origin (dev)
-  half: 6, limit: 6 - 0.45,                       // island half-size and the walkable limit (prototype/js/game.js)
+  half: 8.2, limit: 8.2 - 0.45,                   // half size of the town slab and the walkable limit (HALF in prototype/js/world_city.js)
   speed: 2.7, tolerance: 1.6,                     // client walk speed and how much faster than that we still accept
   maxPlayers: +process.env.MAX_PLAYERS || 200, maxPerIp: +process.env.MAX_PER_IP || 6,
   tickMs: 100, pingMs: 20000, sessionMs: 12 * 3600e3,
@@ -138,7 +138,7 @@ wss.on('connection', (ws, req) => {
   const id = nextId++, nonce = crypto.randomBytes(12).toString('hex');
   const p = {
     id, ws, ip, nonce, addr: null, token: null, guest: 'Guest-' + String(1000 + (id * 7919) % 9000), name: '',
-    x: 0.5 + (Math.random() - 0.5) * 0.8, z: 1.9 + (Math.random() - 0.5) * 0.8, ry: 0.6, mv: false, dirty: false, moveAt: now(), strikes: 0,
+    x: 0.5 + (Math.random() - 0.5) * 0.8, z: 2.0 + (Math.random() - 0.5) * 0.8, ry: 0.6, mv: false, dirty: false, moveAt: now(), strikes: 0,
     chatTimes: [], lastText: '', lastAt: 0, mutedUntil: 0, reports: [], lastReport: 0, alive: true, authBusy: false,
   };
   p.name = p.guest; players.set(id, p); stats.connected++;
