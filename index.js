@@ -198,7 +198,7 @@ function onEnter(p, m) {
   p.space = target; p.x = Number.isFinite(x) ? Math.max(-lx, Math.min(lx, x)) : 0; p.z = Number.isFinite(z) ? Math.max(-lz, Math.min(lz, z)) : 0; p.ry = Number.isFinite(ry) ? ry : 0; p.mv = false; p.moveAt = t; p.strikes = 0;
   const host = owner && [...players.values()].find(q => q.addr === owner && q.token);
   send(p, { t: 'entered', space: target.split(':')[0], x: r2(p.x), z: r2(p.z), ry: r2(p.ry), owner, mine: !!owner && owner === p.addr, ownerName: host ? host.name : null,
-    doc: rec ? rec.doc : null, savedAt: rec ? rec.savedAt : null, floor: target.startsWith('hotel:') ? +target.slice(6) : undefined, venue: venue ? { id: venue.id, no: venue.no, floor: venue.floor, span: venue.span || 1, name: venue.name, cat: venue.cat, desc: venue.desc, by: venue.by, state: venue.state, size: hotel.sizeOf(venue) } : undefined, counts: target.startsWith('hotel:') ? venueCounts() : undefined, players: [...players.values()].filter(q => q !== p && q.space === target).map(pub) });
+    doc: rec ? rec.doc : null, savedAt: rec ? rec.savedAt : null, floor: target.startsWith('hotel:') ? +target.slice(6) : undefined, venue: venue ? { id: venue.id, no: venue.no, floor: venue.floor, span: venue.span || 1, name: venue.name, cat: venue.cat, desc: venue.desc, by: venue.by, state: venue.state, size: hotel.sizeOf(venue), limit: venue.addr ? hotelLib.TEMPLATES[venue.tier].pieces : 60 } : undefined, counts: target.startsWith('hotel:') ? venueCounts() : undefined, players: [...players.values()].filter(q => q !== p && q.space === target).map(pub) });
   bcast(target, { t: 'join', p: pub(p) }, p);
   log('enter', p.name, target);
 }
