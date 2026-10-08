@@ -51,7 +51,7 @@ function open(dataDir, sub = 'rooms', kind = 'room') {
   const dir = path.join(dataDir, sub); fs.mkdirSync(dir, { recursive: true });
   const cache = new Map(), file = addr => path.join(dir, addr + '.json');
   const ok = addr => /^0x[0-9a-f]{40}$/.test(addr);
-  const clean_ = (raw, lim = {}) => sanitize(raw, lim.limit ?? LIMITS.pieces, lim.size ?? LIMITS.size, lim.name ?? 'My Home');
+  const clean_ = (raw, lim = {}) => { const d = sanitize(raw, lim.limit ?? LIMITS.pieces, lim.size ?? LIMITS.size, lim.name ?? 'My Home'); return lim.post ? lim.post(d) : d; };       // post: a last rule on the cleaned document (the facade keeps its door clear)
   return {
     get(addr) {
       if (!ok(addr)) return null;

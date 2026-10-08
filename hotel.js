@@ -22,6 +22,14 @@ const RULES = ['public', 'holders', 'list'];
 const text = (raw, max) => clean(String(raw == null ? '' : raw).slice(0, 200)).text.replace(/\[(link|address) removed\]/g, '').trim().slice(0, max);
 const userList = raw => [...new Set((Array.isArray(raw) ? raw : []).map(s => String(s).toLowerCase().replace(/[^a-z0-9_]/g, '').slice(0, 16)).filter(s => s.length >= 3))].slice(0, 50);
 
+// the door is always there and reachable: nothing may stand in front of it or hang over it (the facade strip is 1.4 m deep, so the whole width of the door is kept free)
+const DOOR_FREE = 0.9;
+function keepDoorClear(doc) {
+  doc.windows = false;                                                  // a facade has no windows of its own
+  doc.pieces = doc.pieces.filter(it => { const d = rooms.CAT.pieces[it.p], hw = ((it.ry || 0) % 180 ? d.fp[1] : d.fp[0]) / 2; const side = (it.ry || 0) % 180 !== 0; if (d.wall && side) return false; return Math.abs(it.x) - hw >= DOOR_FREE - 0.02; });   // wall pieces only on the back wall, none over the door
+  return doc;
+}
+
 function open(dataDir) {
   const metaDir = path.join(dataDir, 'venue_meta'); fs.mkdirSync(metaDir, { recursive: true });
   const docs = rooms.open(dataDir, 'venue_docs', 'venue'), facades = rooms.open(dataDir, 'facade_docs', 'facade');
@@ -55,7 +63,7 @@ function open(dataDir) {
     // the public list: no room documents (visitors get one when they walk in); a never-opened venue shows only that it is opening soon
     list: () => [...all.values()].map(view),
     // the owner's own view of their venue
-    mine: addr => { const v = byOwner.get(addr); return v ? { ...view(v), name: v.name, cat: v.cat, desc: v.desc, tier: v.tier, size: v.size, guests: v.guests, bans: v.bans, hasDoc: !!docs.get(addr), hasFacade: !!facades.get(addr), template: TEMPLATES[v.tier] } : null; },
+    mine: addr => { const v = byOwner.get(addr); return v ? { ...view(v), name: v.name, cat: v.cat, desc: v.desc, tier: v.tier, size: v.size, guests: v.guests, bans: v.bans, hasDoc: !!docs.get(addr), hasFacade: !!facades.get(addr), facade: (facades.get(addr) || {}).doc || null, template: TEMPLATES[v.tier] } : null; },
     // activate: a venue exists, closed, with its door number. One per wallet.
     activate(addr, tier, o = {}) {
       if (byOwner.has(addr)) throw new Error('You already have a venue.');
@@ -83,7 +91,7 @@ function open(dataDir) {
     },
     docs, facades,
     limitsOf: v => ({ limit: TEMPLATES[v.tier].pieces, size: sizeOf(v), name: v.name }),
-    facadeLimits: v => ({ limit: TEMPLATES[v.tier].facade, size: [v.span * SLOT_M, FACADE_DEPTH], name: v.name }),
+    facadeLimits: v => ({ limit: TEMPLATES[v.tier].facade, size: [v.span * SLOT_M, FACADE_DEPTH], name: v.name, post: keepDoorClear }),
     // the facades on one floor (small documents, sent when a player steps onto the floor)
     facadesOn: floor => [...all.values()].filter(v => v.floor === floor && v.addr).map(v => { const f = facades.get(v.addr); return f ? { id: v.id, no: v.no, span: v.span, doc: f.doc } : null; }).filter(Boolean),
     // can this player walk in? -> null (yes) or the guard's reason (usernames and the Chog they play come from the server's player record)

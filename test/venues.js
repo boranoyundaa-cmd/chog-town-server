@@ -89,11 +89,15 @@ async function sign(c, w, kind, d) {                      // prep, sign, save: r
   await sleep(450); T4.send({ t: 'venueset', open: false }); await T4.wait(m => m.t === 'venuemine' && m.mine.state === 'closed'); const hl2 = await hotelList(N); assert.equal(hl2.venues.find(v => v.id === mk.mine.id).state, 'closed'); ok('closing the venue closes the door in the directory');
 
   // facade: its own signed document with the tier's small budget and a strip as wide as the venue's slots
-  const fac = Array.from({ length: 80 }, (_, i) => ({ p: 'plant', x: -4.5 + (i % 10) * 0.9, z: -0.7 + (i % 3) * 0.7 }));
+  const fac = Array.from({ length: 80 }, (_, i) => ({ p: 'plant', x: (i % 2 ? 1 : -1) * (1.6 + (i % 10) * 0.28), z: -0.7 + (i % 3) * 0.7 }));
   await sleep(150); T4.got.length = 0; T4.send({ t: 'facadeprep', doc: doc('front', fac) }); const fp = await T4.wait(m => m.t === 'facadeprep'); assert.equal(fp.n, 60); assert(/Chog Town facade/.test(fp.message)); ok('a tier 4 facade has a budget of 60 pieces');
   await sleep(150); const fs_ = await sign(T4, W4, 'facade', doc('front', fac)); assert.equal(fs_.t, 'facadesaved'); assert(fs_.mine.hasFacade);
   N.got.length = 0; N.send({ t: 'hotelfloor', floor: 2 }); const fl = await N.wait(m => m.t === 'facades' && m.floor === 2); const it = fl.items.find(x => x.id === mk.mine.id); assert(it && it.span === 3 && it.doc.pieces.length === 60); assert(it.doc.pieces.every(q => Math.abs(q.x) <= 4.5 && Math.abs(q.z) <= 0.7)); ok('facades are served per floor, kept inside a strip 9 m wide and 1.4 m deep');
   N.got.length = 0; N.send({ t: 'hotelfloor', floor: 1 }); const f1 = await N.wait(m => m.t === 'facades' && m.floor === 1); assert.equal(f1.items.length, 0); ok('a floor with no facades sends an empty list');
+
+  await sleep(150); const clr = await sign(T4, W4, 'facade', doc('front', [{ p: 'plant', x: 0.2, z: 0 }, { p: 'wallArt', x: 0, z: -0.7 }, { p: 'wallArt', x: 2.5, z: -0.7 }, { p: 'wallArt', x: -4.5, z: 0, ry: 90 }, { p: 'plant', x: -2, z: 0.3 }]));
+  assert.equal(clr.t, 'facadesaved'); N.got.length = 0; N.send({ t: 'hotelfloor', floor: 2 }); const fl2 = await N.wait(m => m.t === 'facades' && m.floor === 2); const kept = fl2.items.find(x => x.id === mk.mine.id).doc.pieces.map(q => q.p + '@' + q.x);
+  assert.deepEqual(kept, ['wallArt@2.5', 'plant@-2']); ok('the facade keeps the door clear: pieces in front of or over it, and side-wall pieces, are dropped');
 
   require('fs').rmSync(process.env.DATA_DIR, { recursive: true, force: true });
   console.log(`\nall ${n} venue checks passed`); process.exit(0);
