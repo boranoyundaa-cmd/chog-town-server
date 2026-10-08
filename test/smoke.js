@@ -45,7 +45,7 @@ let n = 0; const ok = name => console.log(`  ok ${++n} ${name}`);
 
   b.send({ t: 'move', x: 99, z: -99, ry: 0, mv: true }); await sleep(250);
   const last = a.got.filter(m => m.t === 'state').pop().p.find(r => r[0] === joinB.p.id);
-  assert(Math.abs(last[1]) <= 7.76 && Math.abs(last[2]) <= 7.76); ok('positions stay inside the town');
+  assert(Math.abs(last[1]) <= 9.96 && Math.abs(last[2]) <= 9.96); ok('positions stay inside the town');
   a.send({ t: 'move', x: 0.5, z: 1.9, ry: 0, mv: false }); await sleep(120);
   for (let i = 0; i < 4; i++) { a.send({ t: 'move', x: -5, z: -5, ry: 0, mv: true }); await sleep(30); }
   await a.wait(m => m.t === 'snap'); ok('teleporting gets the client snapped back');
@@ -99,7 +99,7 @@ let n = 0; const ok = name => console.log(`  ok ${++n} ${name}`);
   R1.send({ t: 'chat', text: 'secret room talk' }); await sleep(200); assert(!town.got.some(m => m.t === 'chat' && m.text === 'secret room talk')); ok('room chat stays in the room');
   R1.send({ t: 'move', x: 40, z: 40, ry: 0, mv: true }); await sleep(200); R1.send({ t: 'move', x: 40, z: 40, ry: 0, mv: true }); await sleep(150);
 
-  const doc = { name: 'Neon <b>lounge</b> https://evil.xyz', theme: 'cyberpunk', ambience: 'neon', wall: { c: '#112233', pat: 'brick' }, floor: { c: 'red', pat: 'nope' }, windows: false, custom: { x: { parts: [] } },
+  const doc = { name: 'Neon <b>lounge</b> https://evil.xyz', theme: 'cyberpunk', view: 'neon', ambience: 'night', wall: { c: '#112233', pat: 'brick' }, floor: { c: 'red', pat: 'nope' }, windows: false, custom: { x: { parts: [] } },
     pieces: [{ p: 'sofa', x: 0.123, z: 1.5, ry: 180 }, { p: 'wallText', x: -4.5, z: 0, ry: 90, txt: 'HELLO https://bad.io 0x' + 'a'.repeat(40) + ' world', c: '#ff00ff' }, { p: 'doesNotExist', x: 0, z: 0 }, { p: 'nftFrame', x: 0, z: -3.5, img: 'http://x/y.png' }, { p: 'bed', x: 99, z: -99, ry: 45, k: 3, y: 2 }] };
   R1.send({ t: 'roomprep', doc }); const prep = await R1.wait(m => m.t === 'roomprep'); assert(prep.message.includes('Hash:') && prep.n === 3); ok('roomprep returns the cleaned room (3 valid pieces) and a message to sign');
   await sleep(150);
@@ -109,9 +109,14 @@ let n = 0; const ok = name => console.log(`  ok ${++n} ${name}`);
   await sleep(150); R1.send({ t: 'roomsave', doc, ts: prep.ts - 5 * 60e3, sig }); const f3 = await R1.wait(m => m.t === 'roomfail' && /old/.test(m.reason)); ok('an old signature is refused');
   await sleep(150); R1.send({ t: 'roomsave', doc, ts: prep.ts, sig }); const sv = await R1.wait(m => m.t === 'roomsaved'); assert(sv.hash && sv.at); ok('the owner\'s signature stores the room');
 
-  F1.send({ t: 'enter', space: 'room', who: ow.address.toLowerCase(), ...spawn }); const e2 = await F1.wait(m => m.t === 'entered'); assert(!e2.mine); assert.equal(e2.owner, ow.address.toLowerCase());
-  assert(e2.players.some(q => q.id === R1.id)); ok('a friend can visit a saved room and sees the owner there');
-  const d = e2.doc; assert.equal(d.theme, 'cyberpunk'); assert.equal(d.ambience, 'neon'); assert.equal(d.windows, false); assert.deepEqual(d.wall, { c: '#112233', pat: 'brick' }); assert(!d.floor); assert(!('custom' in d)); ok('the stored room keeps the valid settings and drops everything else');
+  F1.got.length = 0; F1.send({ t: 'enter', space: 'room', who: ow.address.toLowerCase(), ...spawn }); const priv = await F1.wait(m => m.t === 'roomfail'); assert(/private/.test(priv.reason)); ok('a Home is private: entering without an invitation is refused');
+  await sleep(800); F1.got.length = 0; F1.send({ t: 'enter', space: 'room', who: ow.address.toLowerCase(), inv: 'f'.repeat(24), ...spawn }); const priv2 = await F1.wait(m => m.t === 'roomfail'); assert(/private/.test(priv2.reason)); ok('a made-up link token is refused');
+  R1.send({ t: 'enter', space: 'city', ...spawn }); await sleep(800); R1.send({ t: 'enter', space: 'room', who: 'me', ...spawn }); await R1.wait(m => m.t === 'entered' && m.space === 'room' && m.doc);
+  F1.send({ t: 'invite', id: R1.id }); await sleep(100); assert(!R1.got.some(m => m.t === 'invited')); ok('a player without a saved Home cannot invite (and cannot invite the owner either)');
+  R1.send({ t: 'invite', id: F1.id }); const inv1 = await F1.wait(m => m.t === 'invited'); assert.equal(inv1.owner, ow.address.toLowerCase()); ok('the owner invites a player and they get the invitation');
+  await sleep(800); F1.send({ t: 'enter', space: 'room', who: inv1.owner, ...spawn }); const e2 = await F1.wait(m => m.t === 'entered' && m.space === 'room'); assert(!e2.mine); assert.equal(e2.owner, ow.address.toLowerCase());
+  assert(e2.players.some(q => q.id === R1.id)); ok('an invited friend can enter the Home and sees the owner there');
+  const d = e2.doc; assert.equal(d.theme, 'cyberpunk'); assert.equal(d.view, 'neon'); assert(!('ambience' in d)); assert.equal(d.windows, false); assert.deepEqual(d.wall, { c: '#112233', pat: 'brick' }); assert(!d.floor); assert(!('custom' in d)); ok('the stored room keeps the valid settings and drops everything else');
   assert.equal(d.pieces.length, 3); assert(d.pieces.every(q => !('img' in q) && !('k' in q) && !('y' in q))); const bed = d.pieces.find(q => q.p === 'bed'); assert.deepEqual(bed, { p: 'bed', x: 4.5, z: -3.5, ry: 90 }); ok('unknown pieces, images, scale and height are stripped; positions are clamped to the floor');
   const wt2 = d.pieces.find(q => q.p === 'wallText'); assert(!/bad\.io|0xaaaa/.test(wt2.txt) && /HELLO/.test(wt2.txt) && wt2.c === '#ff00ff'); assert(!/evil|https/.test(d.name)); ok('links and wallet addresses are removed from room text');
   const sawF = await R1.wait(m => m.t === 'join' && m.p.id === F1.id); ok('the owner sees the visitor arrive');
@@ -120,10 +125,29 @@ let n = 0; const ok = name => console.log(`  ok ${++n} ${name}`);
   await sleep(150); R1.send({ t: 'roomsave', doc: Object.assign({}, doc, { name: 'Second look', pieces: doc.pieces.slice(0, 1) }), ts: p2.ts, sig: await ow.signMessage(p2.message) }); await R1.wait(m => m.t === 'roomsaved');
   const live = await F1.wait(m => m.t === 'roomdoc'); assert.equal(live.doc.name, 'Second look'); ok('visitors receive the new look when the owner saves');
 
-  town.send({ t: 'enter', space: 'room', who: Wallet.createRandom().address, ...spawn }); const nf = await town.wait(m => m.t === 'roomfail'); assert(/not been saved/.test(nf.reason)); ok('visiting a room that was never saved is refused');
+  town.send({ t: 'enter', space: 'room', who: Wallet.createRandom().address, ...spawn }); const nf = await town.wait(m => m.t === 'roomfail'); assert(/private/.test(nf.reason)); ok('entering a Home nobody invited you to is refused');
+  town.got.length = 0; town.send({ t: 'invlink' }); const nl = await town.wait(m => m.t === 'roomfail'); assert(/Save your Home/.test(nl.reason)); ok('a guest cannot make an invite link');
+  R1.send({ t: 'invlink' }); const lk = await R1.wait(m => m.t === 'invlink'); assert(/^[0-9a-f]{24}$/.test(lk.token)); R1.got.length = 0; R1.send({ t: 'invlink' }); const lk2 = await R1.wait(m => m.t === 'invlink'); assert.equal(lk2.token, lk.token); ok('the owner gets a share link, and asking again returns the same one');
+  await sleep(800); town.got.length = 0; town.send({ t: 'enter', space: 'room', who: ow.address.toLowerCase(), inv: lk.token, ...spawn }); const viaLink = await town.wait(m => m.t === 'entered' && m.space === 'room'); assert.equal(viaLink.owner, ow.address.toLowerCase()); ok('anyone with the link token can enter');
+  R1.got.length = 0; R1.send({ t: 'invlink', renew: true }); const lk3 = await R1.wait(m => m.t === 'invlink'); assert.notEqual(lk3.token, lk.token);
+  await sleep(800); town.send({ t: 'enter', space: 'city', ...spawn }); await sleep(800); town.got.length = 0; town.send({ t: 'enter', space: 'room', who: ow.address.toLowerCase(), inv: lk.token, ...spawn }); const old = await town.wait(m => m.t === 'roomfail'); assert(/private/.test(old.reason)); ok('renewing the link revokes the old one');
   town.got.length = 0; town.send({ t: 'roomprep', doc }); const gp = await town.wait(m => m.t === 'roomfail'); assert(/wallet/.test(gp.reason)); ok('a guest cannot save a room');
   await sleep(800); F1.send({ t: 'enter', space: 'city', x: -4.8, z: -2.35, ry: 0 }); const back = await F1.wait(m => m.t === 'entered' && m.space === 'city'); assert(back.players.some(q => q.id === wt.id)); ok('leaving a room returns to the town and its players');
   await R1.wait(m => m.t === 'leave' && m.id === F1.id); ok('the room sees the visitor leave');
+  // ---------- hotel
+  F1.got.length = 0; F1.send({ t: 'hotelinfo' }); const hi = await F1.wait(m => m.t === 'hotel'); assert(hi.floors >= 2 && hi.venues.length >= 10 && hi.venues.every(v => v.id && v.no && v.name && !('doc' in v))); ok('the hotel directory lists the venues (without their room documents)');
+  assert(hi.venues.some(v => v.no === 101 && v.floor === 1)); assert(new Set(hi.venues.map(v => v.no)).size === hi.venues.length); ok('venue numbers are unique and carry their floor');
+  await sleep(450); F1.send({ t: 'enter', space: 'hotel', floor: 0, x: 3.6, z: -2.2, ry: 0 }); const hl = await F1.wait(m => m.t === 'entered' && m.space === 'hotel'); assert.equal(hl.floor, 0); assert(hl.counts && typeof hl.counts === 'object'); ok('a player can enter the hotel lobby (floor 0)');
+  await sleep(450); F1.got.length = 0; F1.send({ t: 'enter', space: 'hotel', floor: 99 }); const nofl = await F1.wait(m => m.t === 'roomfail'); assert(/no such floor/.test(nofl.reason)); ok('a floor that does not exist is refused');
+  await sleep(450); F1.send({ t: 'enter', space: 'hotel', floor: 1, x: -6, z: -6, ry: 0 }); await F1.wait(m => m.t === 'entered' && m.floor === 1);
+  F1.send({ t: 'move', x: 40, z: 40, ry: 0, mv: true }); await sleep(200); F1.send({ t: 'move', x: 40, z: 40, ry: 0, mv: true }); await sleep(150);
+  town.send({ t: 'enter', space: 'hotel', floor: 1, x: -6, z: -6, ry: 0 }); const tf = await town.wait(m => m.t === 'entered' && m.space === 'hotel' && m.floor === 1); assert(tf.players.some(q => q.id === F1.id)); ok('players on the same floor see each other');
+  assert(!tf.players.some(q => q.id === R1.id)); ok('the hotel floors are separate from the town and the rooms');
+  await sleep(450); R1.send({ t: 'enter', space: 'venue', id: 'v101', x: 2.9, z: -2.3, ry: 0 }); const vn = await R1.wait(m => m.t === 'entered' && m.space === 'venue'); assert.equal(vn.venue.name, 'Moka Corner'); assert(vn.doc && vn.doc.pieces.length > 10 && vn.doc.theme === 'studio'); ok('entering a venue gives its room document and its info');
+  const cn = await F1.wait(m => m.t === 'counts' && m.c.v101 === 1); assert(cn); ok('players in the hotel are told how many people are inside each venue');
+  await sleep(450); R1.got.length = 0; R1.send({ t: 'enter', space: 'venue', id: 'nope' }); const nv = await R1.wait(m => m.t === 'roomfail'); assert(/does not exist/.test(nv.reason)); ok('an unknown venue is refused');
+  R1.send({ t: 'chat', text: 'venue talk' }); await sleep(200); assert(!F1.got.some(m => m.t === 'chat' && m.text === 'venue talk')); ok('venue chat stays inside the venue');
+  const lastF = F1.got.filter(m => m.t === 'state').pop(); assert(!lastF || lastF.p.every(r => Math.abs(r[1]) <= 7.41 && Math.abs(r[2]) <= 7.41)); ok('walking limits apply on a hotel floor');
   const big = client(); await big.open; await big.wait(m => m.t === 'welcome'); big.send({ t: 'chat', text: 'x'.repeat(5000) }); await sleep(150); assert(big.ws.readyState === 1); ok('oversized chat frames are ignored');
 
   require('fs').rmSync(process.env.DATA_DIR, { recursive: true, force: true });

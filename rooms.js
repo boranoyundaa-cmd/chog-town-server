@@ -15,12 +15,12 @@ const num = (v, a, b) => Math.max(a, Math.min(b, Math.round((+v || 0) * 100) / 1
 const text = (raw, max) => clean(String(raw == null ? '' : raw).slice(0, 120)).text.replace(/\[(link|address) removed\]/g, '').trim().slice(0, max);
 
 // the cleaned document: fixed key order, so the same room always hashes the same
-function sanitize(doc) {
+function sanitize(doc, limit = LIMITS.pieces) {
   if (!doc || typeof doc !== 'object') throw new Error('no room');
   const [W, D] = LIMITS.size, out = {};
-  out.name = text(doc.name, LIMITS.name) || 'My room';
+  out.name = text(doc.name, LIMITS.name) || 'My Home';
   out.theme = CAT.themes.includes(doc.theme) ? doc.theme : 'studio';
-  out.ambience = CAT.ambiences.includes(doc.ambience) ? doc.ambience : 'day';
+  if (CAT.views.includes(doc.view)) out.view = doc.view;                            // a pinned window view; absent = the real clock (never a light level: interiors are lit by their pieces only)
   for (const [key, pats] of [['wall', CAT.walls], ['floor', CAT.floors]]) {
     const v = doc[key]; if (!v || typeof v !== 'object') continue;
     const o = {}; if (typeof v.c === 'string' && HEX.test(v.c)) o.c = v.c.toLowerCase(); if (pats.includes(v.pat)) o.pat = v.pat;
@@ -28,7 +28,7 @@ function sanitize(doc) {
   }
   if (doc.windows === false) out.windows = false;
   out.pieces = [];
-  for (const it of (Array.isArray(doc.pieces) ? doc.pieces : []).slice(0, LIMITS.pieces)) {
+  for (const it of (Array.isArray(doc.pieces) ? doc.pieces : []).slice(0, limit)) {
     const def = it && CAT.pieces[it.p]; if (!def) continue;
     const o = { p: it.p, x: num(it.x, -W / 2, W / 2), z: num(it.z, -D / 2, D / 2) };
     const ry = ((Math.round((+it.ry || 0) / 90) * 90) % 360 + 360) % 360; if (ry) o.ry = ry;

@@ -8,10 +8,14 @@
 //   logout {}                           drop the wallet, become a guest again
 //   move {x, z, ry, mv}                 position report, ~10 per second
 //   chat {text}  report {id, reason}
-//   enter {space:'city'|'solo'|'room', who:'me'|addr|id, x, z, ry}   change space: the town, a private spot, or somebody's saved room (everything below is per space)
+//   enter {space:'city'|'solo'|'room', who:'me'|addr, inv?, x, z, ry}   change space: the town, a private spot, or a saved Home (the owner's, or one you were invited to by a direct invitation or the link token `inv`)
+//   enter {space:'hotel', floor}        the Chog Hotel: floor 0 is the lobby;  enter {space:'venue', id}: a hotel venue (a room document)
+//   hotelinfo {} -> hotel {floors, venues, counts}   the directory;  counts {c:{venueId:n}} is pushed to players in the hotel when people come and go
+//   invite {id}                         invite a player to your saved Home (30 minutes)  ->  they get invited {owner, from}
+//   invlink {renew?} -> invlink {token, exp}     your Home's share link token (renew = revoke the old link)
 //   roomprep {doc} -> roomprep {message, ts}     the cleaned room and the text the wallet must sign
 //   roomsave {doc, ts, sig}                      store the room if the wallet signed exactly that text
-// Server -> client: welcome, authed, authfail, appear (full player), join, leave, state, snap, chat, sys, entered, roomprep, roomsaved, roomfail, roomdoc.
+// Server -> client: welcome, authed, authfail, appear (full player), join, leave, state, snap, chat, sys, entered, roomprep, roomsaved, roomfail, roomdoc, invited, invlink, hotel, counts.
 const http = require('http');
 const crypto = require('crypto');
 const fs = require('fs');
@@ -20,13 +24,15 @@ const { WebSocketServer } = require('ws');
 const { verifyMessage } = require('ethers');
 const { clean } = require('./filter');
 const roomsLib = require('./rooms');
+const invitesLib = require('./invites');
+const hotel = require('./hotel');
 
 const CFG = {
   port: +process.env.PORT || 8767,
   rpc: process.env.RPC_URL || 'https://rpc.monad.xyz',
   nft: (process.env.NFT_ADDR || '0xc96d31f8626c6d03fae5dcd3d61e3fb9f4a73763').toLowerCase(),
   origins: (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean),   // empty = any origin (dev)
-  half: 8.2, limit: 8.2 - 0.45,                   // half size of the town slab and the walkable limit (HALF in prototype/js/world_city.js)
+  half: 10.4, limit: 10.4 - 0.45,                 // half size of the town slab and the walkable limit (HALF in prototype/js/world_city.js)
   speed: 2.7, tolerance: 1.6,                     // client walk speed and how much faster than that we still accept
   maxPlayers: +process.env.MAX_PLAYERS || 200, maxPerIp: +process.env.MAX_PER_IP || 6,
   tickMs: 100, pingMs: 20000, sessionMs: 12 * 3600e3,
@@ -37,9 +43,12 @@ const CFG = {
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');          // on Fly this is a mounted volume (docs/engineering/server.md), otherwise rooms vanish on every deploy
 fs.mkdirSync(DATA_DIR, { recursive: true });
 const rooms = roomsLib.open(DATA_DIR);
+const invites = invitesLib.open(DATA_DIR);
 const [ROOM_W, ROOM_D] = roomsLib.LIMITS.size;
 const ROOM_LIMIT = [ROOM_W / 2 - 0.2, ROOM_D / 2 - 0.2];                         // walking limit on the room floor (the client keeps 0.3 off the walls)
-const limitsOf = space => (space.startsWith('city') ? [CFG.limit, CFG.limit] : ROOM_LIMIT);
+const HOTEL_LOBBY = [5.3, 3.8], HOTEL_FLOOR = [7.4, 7.4];                         // walking limits in the hotel lobby and on a floor (HOTEL in prototype/js/hotel.js)
+const limitsOf = space => (space.startsWith('city') ? [CFG.limit, CFG.limit] : space === 'hotel:0' ? HOTEL_LOBBY : space.startsWith('hotel:') ? HOTEL_FLOOR : ROOM_LIMIT);
+const venueCounts = () => { const c = {}; for (const q of players.values()) if (q.space.startsWith('venue:')) c[q.space.slice(6)] = (c[q.space.slice(6)] || 0) + 1; return c; };   // real players only
 
 // ---------- state
 let nextId = 1;
@@ -132,28 +141,50 @@ function onMove(p, m) {
 
 // ---------- spaces: the town, a private spot, or a saved room (presence, chat and movement never cross a space)
 const roomFail = (p, reason) => send(p, { t: 'roomfail', reason });
+const invited = (p, owner, token) => (p.invitedTo.get(owner) || 0) > now() || invites.check(token, owner, now());
 function onEnter(p, m) {
-  const t = now(); if (t - p.lastEnter < 700) return; p.lastEnter = t;
-  let target, owner = null, rec = null;
+  const t = now(); if (t - p.lastEnter < 400) return; p.lastEnter = t;
+  let target, owner = null, rec = null, venue = null;
   if (m.space === 'city') target = 'city';
   else if (m.space === 'solo') target = 'solo:' + p.id;
   else if (m.space === 'room') {
-    if (m.who === 'me') { if (!p.addr) return roomFail(p, 'Sign in with your wallet to open your saved room.'); owner = p.addr; }
-    else if (typeof m.who === 'string' && /^0x[0-9a-fA-F]{40}$/.test(m.who)) owner = m.who.toLowerCase();
-    else if (Number.isFinite(+m.who)) { const q = players.get(+m.who); if (!q || !q.addr) return roomFail(p, 'That player has no saved room (no wallet connected).'); owner = q.addr; }
-    else return;
+    if (m.who === 'me') { if (!p.addr) return roomFail(p, 'Sign in with your wallet to open your saved Home.'); owner = p.addr; }
+    else if (typeof m.who === 'string' && /^0x[0-9a-fA-F]{40}$/.test(m.who)) {
+      owner = m.who.toLowerCase();
+      if (owner !== p.addr && !invited(p, owner, m.inv)) return roomFail(p, 'That Home is private. Ask its owner to invite you.');       // a Home opens only for its owner and invited players
+    } else return;
     rec = rooms.get(owner);
-    if (!rec && owner !== p.addr) return roomFail(p, 'That room has not been saved yet.');
+    if (!rec && owner !== p.addr) return roomFail(p, 'That Home is not ready yet.');
     target = 'room:' + owner;
+  } else if (m.space === 'hotel') {
+    const f = Math.floor(+m.floor); if (!(f >= 0 && f <= hotel.floors())) return roomFail(p, 'There is no such floor.');
+    target = 'hotel:' + f;
+  } else if (m.space === 'venue') {
+    venue = hotel.get(String(m.id)); if (!venue) return roomFail(p, 'That room does not exist.');
+    target = 'venue:' + venue.id; rec = { doc: venue.doc, savedAt: null };
   } else return;
   const [lx, lz] = limitsOf(target), x = +m.x, z = +m.z, ry = +m.ry;
   bcast(p.space, { t: 'leave', id: p.id }, p);
   p.space = target; p.x = Number.isFinite(x) ? Math.max(-lx, Math.min(lx, x)) : 0; p.z = Number.isFinite(z) ? Math.max(-lz, Math.min(lz, z)) : 0; p.ry = Number.isFinite(ry) ? ry : 0; p.mv = false; p.moveAt = t; p.strikes = 0;
   const host = owner && [...players.values()].find(q => q.addr === owner && q.token);
   send(p, { t: 'entered', space: target.split(':')[0], x: r2(p.x), z: r2(p.z), ry: r2(p.ry), owner, mine: !!owner && owner === p.addr, ownerName: host ? host.name : null,
-    doc: rec ? rec.doc : null, savedAt: rec ? rec.savedAt : null, players: [...players.values()].filter(q => q !== p && q.space === target).map(pub) });
+    doc: rec ? rec.doc : null, savedAt: rec ? rec.savedAt : null, floor: target.startsWith('hotel:') ? +target.slice(6) : undefined, venue: venue ? { id: venue.id, no: venue.no, floor: venue.floor, name: venue.name, cat: venue.cat, desc: venue.desc, by: venue.by } : undefined, counts: target.startsWith('hotel:') ? venueCounts() : undefined, players: [...players.values()].filter(q => q !== p && q.space === target).map(pub) });
   bcast(target, { t: 'join', p: pub(p) }, p);
   log('enter', p.name, target);
+}
+function onInvite(p, m) {
+  if (!p.addr || !rooms.get(p.addr)) return sys(p, 'Connect your wallet and save your Home first, then you can invite people.');
+  const t = now(); if (t - p.lastInvite < 2000) return sys(p, 'Slow down a little.'); p.lastInvite = t;
+  const q = players.get(+m.id); if (!q || q === p) return;
+  for (const [k, e] of q.invitedTo) if (e <= t) q.invitedTo.delete(k);
+  if (q.invitedTo.size >= 20 && !q.invitedTo.has(p.addr)) return sys(p, 'That player has too many invitations right now.');
+  q.invitedTo.set(p.addr, t + invitesLib.DIRECT_MS);
+  send(q, { t: 'invited', owner: p.addr, from: p.name, token: p.token, exp: t + invitesLib.DIRECT_MS });
+  sys(p, `Invitation sent to ${q.name}.`);
+}
+function onInvLink(p, m) {
+  if (!p.addr || !rooms.get(p.addr)) return roomFail(p, 'Save your Home first, then you can share a link.');
+  const l = invites.link(p.addr, !!m.renew); send(p, { t: 'invlink', token: l.token, exp: l.exp });
 }
 function onRoomPrep(p, m) {
   if (!p.addr) return roomFail(p, 'Connect and sign in with your wallet to save your room.');
@@ -188,12 +219,12 @@ wss.on('connection', (ws, req) => {
 
   const id = nextId++, nonce = crypto.randomBytes(12).toString('hex');
   const p = {
-    id, ws, ip, nonce, addr: null, token: null, space: 'city', lastEnter: 0, lastPrep: 0, lastSave: 0, guest: 'Guest-' + String(1000 + (id * 7919) % 9000), name: '',
+    id, ws, ip, nonce, addr: null, token: null, space: 'city', lastEnter: 0, lastPrep: 0, lastSave: 0, lastInvite: 0, invitedTo: new Map(), guest: 'Guest-' + String(1000 + (id * 7919) % 9000), name: '',
     x: 0.5 + (Math.random() - 0.5) * 0.8, z: 2.0 + (Math.random() - 0.5) * 0.8, ry: 0.6, mv: false, dirty: false, moveAt: now(), strikes: 0,
     chatTimes: [], lastText: '', lastAt: 0, mutedUntil: 0, reports: [], lastReport: 0, alive: true, authBusy: false,
   };
   p.name = p.guest; players.set(id, p); stats.connected++;
-  send(p, { t: 'welcome', id, name: p.name, challenge: challengeText(nonce), players: [...players.values()].filter(q => q !== p && q.space === 'city').map(pub), you: pub(p), maxChat: CFG.chatMax, rooms: 1 });
+  send(p, { t: 'welcome', id, name: p.name, challenge: challengeText(nonce), players: [...players.values()].filter(q => q !== p && q.space === 'city').map(pub), you: pub(p), maxChat: CFG.chatMax, rooms: 1, hotel: 1 });
   bcast('city', { t: 'join', p: pub(p) }, p);
   log('join', p.name, `(${players.size} online)`);
 
@@ -207,6 +238,9 @@ wss.on('connection', (ws, req) => {
       if (m.t === 'chat') return onChat(p, m.text);
       if (m.t === 'report') return onReport(p, m);
       if (m.t === 'enter') return onEnter(p, m);
+      if (m.t === 'hotelinfo') return send(p, { t: 'hotel', floors: hotel.floors(), venues: hotel.list(), counts: venueCounts() });
+      if (m.t === 'invite') return onInvite(p, m);
+      if (m.t === 'invlink') return onInvLink(p, m);
       if (m.t === 'roomprep') return onRoomPrep(p, m);
       if (m.t === 'roomsave') return onRoomSave(p, m);
       if (m.t === 'logout') { p.addr = null; return setLook(p, null); }
@@ -247,6 +281,11 @@ setInterval(() => {                                    // 10 Hz: send only the p
   const moved = new Map(); for (const p of players.values()) if (p.dirty) { if (!moved.has(p.space)) moved.set(p.space, []); moved.get(p.space).push([p.id, r2(p.x), r2(p.z), r2(p.ry), p.mv ? 1 : 0]); p.dirty = false; }
   for (const [space, list] of moved) bcast(space, { t: 'state', p: list });
 }, CFG.tickMs);
+let lastCounts = '{}';
+setInterval(() => {                                    // who is inside which hotel venue: pushed to the players in the hotel only when it changed
+  const c = venueCounts(), j = JSON.stringify(c); if (j === lastCounts) return; lastCounts = j;
+  for (const p of players.values()) if (p.space.startsWith('hotel:')) send(p, { t: 'counts', c });
+}, 2000);
 setInterval(() => {                                    // drop dead sockets, expire sessions
   for (const p of players.values()) { if (!p.alive) { p.ws.terminate(); continue; } p.alive = false; try { p.ws.ping(); } catch (e) { /* closing */ } }
   const t = now(); for (const [k, s] of sessions) if (s.exp < t) sessions.delete(k);
