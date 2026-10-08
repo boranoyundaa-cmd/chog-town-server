@@ -1,0 +1,27 @@
+# Fly.io config for the Chog Town realtime server. Deploy: `fly deploy` from this folder (after `fly launch --no-deploy --copy-config`).
+app = "chog-town-ws"
+primary_region = "fra"            # Frankfurt: closest Fly region to Turkey
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "8767"
+
+[http_service]
+  internal_port = 8767
+  force_https = true
+  auto_stop_machines = "off"      # never sleep: open WebSockets are the product
+  auto_start_machines = false
+  min_machines_running = 1
+
+  [[http_service.checks]]
+    grace_period = "10s"
+    interval = "30s"
+    timeout = "3s"
+    method = "GET"
+    path = "/health"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"

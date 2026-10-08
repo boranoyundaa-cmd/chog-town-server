@@ -128,7 +128,7 @@ const server = http.createServer((req, res) => {
 const wss = new WebSocketServer({ server, maxPayload: 2048, perMessageDeflate: false });
 
 wss.on('connection', (ws, req) => {
-  const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '?').toString().split(',')[0].trim();
+  const ip = (req.headers['fly-client-ip'] || req.socket.remoteAddress || '?').toString().trim();      // fly-client-ip is set by Fly's proxy; x-forwarded-for is client-controlled, so it is not used
   const origin = req.headers.origin;
   if (CFG.origins.length && !CFG.origins.includes(origin)) return ws.close(4003, 'origin');
   if (players.size >= CFG.maxPlayers) return ws.close(4002, 'full');
