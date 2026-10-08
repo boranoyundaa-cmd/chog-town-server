@@ -12,6 +12,7 @@
 //   enter {space:'hotel', floor}        the Chog Hotel: floor 0 is the lobby;  enter {space:'venue', id}: a hotel venue (a room document)
 //   hotelinfo {} -> hotel {floors, venues, counts}   the directory;  counts {c:{venueId:n}} is pushed to players in the hotel when people come and go
 //   hotelfloor {floor} -> facades {floor, items}      the facade documents on one floor (sent when a player steps onto it)
+//   usernameprep {name} -> usernameprep {message, ts} / usernamesave {name, ts, sig} -> username {name}   claim a unique username with the wallet (guest lists use it)
 //   venueinfo {} -> venueinfo {tier, points, templates, mine}      the wallet's license and venue (checked on chain, cached)
 //   venuemake {name, cat, desc} -> venuemine {mine}                activate a venue from the license: it starts CLOSED
 //   venueprep {doc} / venuesave {doc, ts, sig}     the venue room (a signed document, like a Home, with the tier's budget);  facadeprep / facadesave the same for the corridor facade
@@ -32,6 +33,7 @@ const roomsLib = require('./rooms');
 const invitesLib = require('./invites');
 const hotelLib = require('./hotel');
 const licenseLib = require('./license');
+const usersLib = require('./users');
 
 const CFG = {
   port: +process.env.PORT || 8767,
@@ -51,6 +53,7 @@ fs.mkdirSync(DATA_DIR, { recursive: true });
 const rooms = roomsLib.open(DATA_DIR);
 const invites = invitesLib.open(DATA_DIR);
 const hotel = hotelLib.open(DATA_DIR);
+const users = usersLib.open(DATA_DIR);
 const [ROOM_W, ROOM_D] = roomsLib.LIMITS.size;
 const ROOM_LIMIT = [ROOM_W / 2 - 0.2, ROOM_D / 2 - 0.2];                         // walking limit on the room floor (the client keeps 0.3 off the walls)
 const HOTEL_LOBBY = [5.3, 3.8], HOTEL_FLOOR = [7.4, 7.4];                         // walking limits in the hotel lobby and on a floor (HOTEL in prototype/js/hotel.js)
@@ -109,6 +112,8 @@ const chain = {                                    // what the license needs fro
 const license = licenseLib.open(chain);
 const challengeText = nonce => `Chog Town sign-in\nThis proves you control this wallet. It costs nothing and sends no transaction.\nNonce: ${nonce}`;
 
+// what everyone sees: the claimed username, else the Chog they play as, else the automatic guest name
+const shownName = p => p.username || (p.token ? `Chog #${p.token}` : p.guest);
 function setLook(p, token) {                       // token is already verified (or null for the default Chog)
   if (p.token && byToken.get(p.token) === p) byToken.delete(p.token);
   if (token) {
@@ -117,7 +122,7 @@ function setLook(p, token) {                       // token is already verified 
     byToken.set(token, p);
   }
   p.token = token || null;
-  p.name = token ? `Chog #${token}` : p.guest;
+  p.name = shownName(p);
   bcast(p.space, { t: 'appear', p: pub(p) });
 }
 
@@ -244,7 +249,7 @@ async function onVenueInfo(p) {
   send(p, { t: 'venueinfo', tier: L.tier, points: L.points, tokens: L.tokens.length, templates: hotelLib.TEMPLATES, mine: hotel.mine(p.addr) });
 }
 async function onVenueMake(p, m) {
-  const t = now(); if (t - p.lastVenue < 1000) return; p.lastVenue = t;
+  const t = now(); if (t - p.lastVenue < 1000) return roomFail(p, 'Slow down a little.'); p.lastVenue = t;
   const L = await ownLicense(p, true);
   if (!L.tier) return roomFail(p, 'You need a Chog to open a venue.');
   const v = hotel.activate(p.addr, L.tier, { name: m.name, cat: m.cat, desc: m.desc, by: p.username || p.name });
@@ -253,7 +258,7 @@ async function onVenueMake(p, m) {
 }
 function onVenueSet(p, m) {
   if (!p.addr || !hotel.byOwner(p.addr)) return roomFail(p, 'You have no venue yet.');
-  const t = now(); if (t - p.lastVenue < 400) return; p.lastVenue = t;
+  const t = now(); if (t - p.lastVenue < 400) return roomFail(p, 'Slow down a little.'); p.lastVenue = t;
   const before = JSON.stringify(hotel.list().find(v => v.id === hotel.byOwner(p.addr).id));
   hotel.update(p.addr, { open: m.open === undefined ? undefined : !!m.open, rule: m.rule, guests: m.guests, bans: m.bans, name: m.name, cat: m.cat, desc: m.desc });
   const v = hotel.byOwner(p.addr);
@@ -276,6 +281,22 @@ function onVenueSave(p, m, kind) {
     if (kind === 'venue') bcast('venue:' + v.id, { t: 'roomdoc', doc: rec.doc, savedAt: rec.savedAt }, p);
     else for (const q of players.values()) if (q.space === 'hotel:' + v.floor) send(q, { t: 'facades', floor: v.floor, items: hotel.facadesOn(v.floor) });
     log(kind + ' saved', p.addr, rec.doc.pieces.length + ' pieces');
+  } catch (e) { roomFail(p, e.message); }
+}
+
+// ---------- usernames
+function onUsernamePrep(p, m) {
+  if (!p.addr) return roomFail(p, 'Connect and sign in with your wallet to choose a username.');
+  const t = now(); if (t - p.lastPrep < CFG.roomPrepMs) return roomFail(p, 'Slow down a little.'); p.lastPrep = t;
+  try { const r = users.prepare(p.addr, String(m.name)); send(p, { t: 'usernameprep', name: String(m.name), message: r.message, ts: r.ts }); } catch (e) { roomFail(p, e.message); }
+}
+function onUsernameSave(p, m) {
+  if (!p.addr) return roomFail(p, 'Connect and sign in with your wallet to choose a username.');
+  const t = now(); if (t - p.lastSave < CFG.roomSaveMs) return roomFail(p, 'Slow down a little.'); p.lastSave = t;
+  try {
+    const name = users.claim(p.addr, String(m.name), m.ts, m.sig);
+    p.username = name; p.name = shownName(p); bcast(p.space, { t: 'appear', p: pub(p) }); send(p, { t: 'username', name });
+    log('username', p.addr, name);
   } catch (e) { roomFail(p, e.message); }
 }
 
@@ -317,6 +338,8 @@ wss.on('connection', (ws, req) => {
       if (m.t === 'enter') return onEnter(p, m);
       if (m.t === 'hotelinfo') return send(p, { t: 'hotel', floors: hotel.floors(), venues: hotel.list(), counts: venueCounts() });
       if (m.t === 'hotelfloor') { const f = Math.floor(+m.floor); return send(p, { t: 'facades', floor: f, items: hotel.facadesOn(f) }); }
+      if (m.t === 'usernameprep') return onUsernamePrep(p, m);
+      if (m.t === 'usernamesave') return onUsernameSave(p, m);
       if (m.t === 'venueinfo') return await onVenueInfo(p);
       if (m.t === 'venuemake') return await onVenueMake(p, m);
       if (m.t === 'venueset') return onVenueSet(p, m);
@@ -328,7 +351,7 @@ wss.on('connection', (ws, req) => {
       if (m.t === 'invlink') return onInvLink(p, m);
       if (m.t === 'roomprep') return onRoomPrep(p, m);
       if (m.t === 'roomsave') return onRoomSave(p, m);
-      if (m.t === 'logout') { p.addr = null; return setLook(p, null); }
+      if (m.t === 'logout') { p.addr = null; p.username = null; return setLook(p, null); }
       if (m.t === 'auth') {
         if (p.authBusy) return; p.authBusy = true;
         try {
@@ -336,10 +359,10 @@ wss.on('connection', (ws, req) => {
           if (typeof m.session === 'string' && sessions.has(m.session) && sessions.get(m.session).exp > now()) addr = sessions.get(m.session).addr;
           else if (typeof m.sig === 'string') addr = verifyMessage(challengeText(p.nonce), m.sig).toLowerCase();
           if (!addr) return send(p, { t: 'authfail', reason: 'bad proof' });
-          p.addr = addr;
+          p.addr = addr; p.username = users.nameOf(addr); if (p.username) { p.name = shownName(p); bcast(p.space, { t: 'appear', p: pub(p) }); }
           let session = typeof m.session === 'string' && sessions.has(m.session) ? m.session : null;
           if (!session) { session = crypto.randomBytes(24).toString('hex'); sessions.set(session, { addr, exp: now() + CFG.sessionMs }); }
-          send(p, { t: 'authed', addr, session });
+          send(p, { t: 'authed', addr, session, username: p.username });
         } catch (e) { send(p, { t: 'authfail', reason: 'bad proof' }); } finally { p.authBusy = false; }
         return;
       }

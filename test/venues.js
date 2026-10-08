@@ -52,7 +52,7 @@ async function sign(c, w, kind, d) {                      // prep, sign, save: r
   T4.send({ t: 'venueinfo' }); const i4 = await T4.wait(m => m.t === 'venueinfo'); assert.equal(i4.tier, 4); assert.equal(i4.mine, null); ok('the license is read from the chain: a Legendary is tier 4');
   await sleep(1100); T1.send({ t: 'venueinfo' }); const i1 = await T1.wait(m => m.t === 'venueinfo'); assert.equal(i1.tier, 1); ok('an Uncommon is tier 1');
   await sleep(1100); N.send({ t: 'venueinfo' }); const i0 = await N.wait(m => m.t === 'venueinfo'); assert.equal(i0.tier, 0); ok('a wallet without a Chog has tier 0');
-  N.send({ t: 'venuemake', name: 'Nope' }); await sleep(1100); N.send({ t: 'venuemake', name: 'Nope' }); const f0 = await N.wait(m => m.t === 'roomfail'); assert(/need a Chog/.test(f0.reason)); ok('without a Chog no venue can be made');
+  await sleep(1100); N.got.length = 0; N.send({ t: 'venuemake', name: 'Nope' }); const f0 = await N.wait(m => m.t === 'roomfail'); assert(/need a Chog/.test(f0.reason)); ok('without a Chog no venue can be made');
   const guest = client(); await guest.open; await guest.wait(m => m.t === 'welcome'); guest.send({ t: 'venueinfo' }); await sleep(300); assert(!guest.got.some(m => m.t === 'venueinfo')); ok('a guest cannot ask for a license');
 
   const calls = rpcCalls; await sleep(1100); T4.send({ t: 'venueinfo' }); await T4.next(m => m.t === 'venueinfo'); assert.equal(rpcCalls, calls); ok('the license is cached (no new chain calls)');
@@ -98,6 +98,18 @@ async function sign(c, w, kind, d) {                      // prep, sign, save: r
   await sleep(150); const clr = await sign(T4, W4, 'facade', doc('front', [{ p: 'plant', x: 0.2, z: 0 }, { p: 'wallArt', x: 0, z: -0.7 }, { p: 'wallArt', x: 2.5, z: -0.7 }, { p: 'wallArt', x: -4.5, z: 0, ry: 90 }, { p: 'plant', x: -2, z: 0.3 }]));
   assert.equal(clr.t, 'facadesaved'); N.got.length = 0; N.send({ t: 'hotelfloor', floor: 2 }); const fl2 = await N.wait(m => m.t === 'facades' && m.floor === 2); const kept = fl2.items.find(x => x.id === mk.mine.id).doc.pieces.map(q => q.p + '@' + q.x);
   assert.deepEqual(kept, ['wallArt@2.5', 'plant@-2']); ok('the facade keeps the door clear: pieces in front of or over it, and side-wall pieces, are dropped');
+
+  // ---------- usernames and the guard's list
+  async function claim(c, w, name) { c.got.length = 0; c.send({ t: 'usernameprep', name }); const pr = await c.wait(m => m.t === 'usernameprep' || m.t === 'roomfail'); if (pr.t === 'roomfail') return pr; await sleep(120); c.got.length = 0; c.send({ t: 'usernamesave', name, ts: pr.ts, sig: await w.signMessage(pr.message) }); return c.wait(m => m.t === 'username' || m.t === 'roomfail'); }
+  await sleep(150); const bad1 = await claim(T4, W4, 'ab'); assert(/3 to 16/.test(bad1.reason)); await sleep(150); const bad2 = await claim(T4, W4, 'Guest_1234'); assert(/reserved/.test(bad2.reason)); await sleep(150); const bad3 = await claim(T4, W4, 'admin'); assert(/reserved/.test(bad3.reason)); ok('usernames: too short and reserved or look-alike names are refused');
+  await sleep(150); const u4 = await claim(T4, W4, 'Skyline_DJ'); assert.equal(u4.t, 'username'); assert.equal(u4.name, 'Skyline_DJ'); ok('a wallet claims a username by signing');
+  await sleep(150); const dup = await claim(T1, W1, 'skyline_dj'); assert.equal(dup.t, 'roomfail'); assert(/taken/.test(dup.reason)); ok('names are unique, ignoring case');
+  await sleep(150); const again = await claim(T4, W4, 'Skyline_Two'); assert(/once every 7 days/.test(again.reason)); ok('a name can be changed only once a week');
+  await sleep(150); N.send({ t: 'enter', space: 'city', x: 0, z: 0, ry: 0 }); const w4 = client(); await w4.open; const ww = await w4.wait(m => m.t === 'welcome'); w4.send({ t: 'auth', sig: await W4.signMessage(ww.challenge) }); const a4 = await w4.wait(m => m.t === 'authed'); assert.equal(a4.username, 'Skyline_DJ'); ok('the username comes back when the wallet signs in again');
+  await sleep(150); const u1 = await claim(T1, W1, 'Bob_One'); assert.equal(u1.t, 'username');
+  await sleep(500); T4.send({ t: 'venueset', open: true, rule: 'list', guests: ['bob_one'], bans: [] }); await T4.wait(m => m.t === 'venuemine' && m.mine.state === 'open' && m.mine.guests.length === 1);
+  await sleep(450); T1.send({ t: 'enter', space: 'hotel', floor: 2, x: -6, z: -6, ry: 0 }); await sleep(450); T1.got.length = 0; T1.send({ t: 'enter', space: 'venue', id: mk.mine.id, x: 0, z: 0, ry: 0 }); const lin = await T1.wait(m => m.t === 'entered' || m.t === 'roomfail'); assert.equal(lin.t, 'entered'); ok('a name on the guest list is let in');
+  await sleep(500); T4.send({ t: 'venueset', rule: 'public', bans: ['Bob_One'] }); await T4.wait(m => m.t === 'venuemine' && m.mine.bans.length === 1); T1.send({ t: 'enter', space: 'hotel', floor: 2, x: -6, z: -6, ry: 0 }); await sleep(450); T1.got.length = 0; T1.send({ t: 'enter', space: 'venue', id: mk.mine.id, x: 0, z: 0, ry: 0 }); const ban = await T1.wait(m => m.t === 'entered' || m.t === 'roomfail'); assert.equal(ban.t, 'roomfail'); assert(/guard turns you away/.test(ban.reason)); ok('a banned name is turned away even when the venue is open to everyone');
 
   require('fs').rmSync(process.env.DATA_DIR, { recursive: true, force: true });
   console.log(`\nall ${n} venue checks passed`); process.exit(0);
