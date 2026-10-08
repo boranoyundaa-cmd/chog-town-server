@@ -2,9 +2,9 @@ FROM node:22-alpine
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
-COPY index.js filter.js ./
-RUN mkdir -p /app/data && chown node:node /app/data
+COPY index.js filter.js rooms.js room_catalog.json ./
+RUN apk add --no-cache su-exec && mkdir -p /app/data && chown node:node /app/data
 ENV NODE_ENV=production PORT=8767
 EXPOSE 8767
-USER node
-CMD ["node", "index.js"]
+# the Fly volume is mounted at /data owned by root: fix its owner, then drop to the unprivileged user
+CMD ["sh", "-c", "chown -R node:node /data 2>/dev/null; exec su-exec node node index.js"]

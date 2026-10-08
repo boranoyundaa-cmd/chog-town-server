@@ -1,6 +1,7 @@
 'use strict';
 // Smoke test: starts the server on a spare port and drives it with real WebSocket clients.  Run: npm test
-process.env.PORT = '18767';
+process.env.PORT = '18767'; process.env.ROOM_PREP_MS = '50'; process.env.ROOM_SAVE_MS = '50';
+process.env.DATA_DIR = require('path').join(require('os').tmpdir(), 'chog-test-' + process.pid);       // rooms are written here, not into server/data
 process.env.RPC_URL = 'http://127.0.0.1:18768';          // a stand-in for the chain: ownerOf(1700) is the test wallet, everything else is someone else
 const assert = require('assert');
 const http = require('http');
@@ -84,5 +85,47 @@ let n = 0; const ok = name => console.log(`  ok ${++n} ${name}`);
   a.send({ t: 'chat', text: 'am I muted' }); await a.wait(m => m.t === 'sys' && /muted for/.test(m.text)); ok('a muted player cannot chat');
 
   b.ws.close(); await a.wait(m => m.t === 'leave' && m.id === joinB.p.id); ok('leave is broadcast');
+
+  // ---------- spaces and rooms
+  for (const c of [a, a2, bad, h1, h2]) c.ws.close(); await sleep(300);                // the per-IP connection limit is 6
+  const login = async (w) => { const c = client(); await c.open; const wc = await c.wait(m => m.t === 'welcome'); c.id = wc.id; c.send({ t: 'auth', sig: await w.signMessage(wc.challenge) }); await c.wait(m => m.t === 'authed'); return c; };
+  const ow = Wallet.createRandom(), friend = Wallet.createRandom();
+  const R1 = await login(ow), F1 = await login(friend), town = client(); await town.open; const wt = await town.wait(m => m.t === 'welcome');
+  const spawn = { x: 2.9, z: -2.3, ry: 0 };
+  R1.send({ t: 'enter', space: 'room', who: 'me', ...spawn }); const e1 = await R1.wait(m => m.t === 'entered'); assert.equal(e1.space, 'room'); assert.equal(e1.doc, null); assert(e1.mine); ok('entering your own room before saving gives an empty room (the client brings its starter)');
+  await town.wait(m => m.t === 'leave' && m.id === R1.id); ok('the town sees the player leave when they enter a room');
+  R1.send({ t: 'move', x: 2.9, z: -2.0, ry: 0, mv: true }); await sleep(250);
+  assert(!town.got.some(m => m.t === 'state' && m.p.some(r => r[0] === R1.id))); ok('movement inside a room does not reach the town');
+  R1.send({ t: 'chat', text: 'secret room talk' }); await sleep(200); assert(!town.got.some(m => m.t === 'chat' && m.text === 'secret room talk')); ok('room chat stays in the room');
+  R1.send({ t: 'move', x: 40, z: 40, ry: 0, mv: true }); await sleep(200); R1.send({ t: 'move', x: 40, z: 40, ry: 0, mv: true }); await sleep(150);
+
+  const doc = { name: 'Neon <b>lounge</b> https://evil.xyz', theme: 'cyberpunk', ambience: 'neon', wall: { c: '#112233', pat: 'brick' }, floor: { c: 'red', pat: 'nope' }, windows: false, custom: { x: { parts: [] } },
+    pieces: [{ p: 'sofa', x: 0.123, z: 1.5, ry: 180 }, { p: 'wallText', x: -4.5, z: 0, ry: 90, txt: 'HELLO https://bad.io 0x' + 'a'.repeat(40) + ' world', c: '#ff00ff' }, { p: 'doesNotExist', x: 0, z: 0 }, { p: 'nftFrame', x: 0, z: -3.5, img: 'http://x/y.png' }, { p: 'bed', x: 99, z: -99, ry: 45, k: 3, y: 2 }] };
+  R1.send({ t: 'roomprep', doc }); const prep = await R1.wait(m => m.t === 'roomprep'); assert(prep.message.includes('Hash:') && prep.n === 3); ok('roomprep returns the cleaned room (3 valid pieces) and a message to sign');
+  await sleep(150);
+  const sig = await ow.signMessage(prep.message);
+  F1.send({ t: 'roomsave', doc, ts: prep.ts, sig }); const ff = await F1.wait(m => m.t === 'roomfail'); assert(/another wallet|not valid/.test(ff.reason)); ok('a signature from another wallet is refused');
+  await sleep(150); R1.send({ t: 'roomsave', doc: Object.assign({}, doc, { name: 'Changed after signing' }), ts: prep.ts, sig }); const f2 = await R1.wait(m => m.t === 'roomfail'); assert(/another wallet|not valid/.test(f2.reason)); ok('a signature over a different document is refused');
+  await sleep(150); R1.send({ t: 'roomsave', doc, ts: prep.ts - 5 * 60e3, sig }); const f3 = await R1.wait(m => m.t === 'roomfail' && /old/.test(m.reason)); ok('an old signature is refused');
+  await sleep(150); R1.send({ t: 'roomsave', doc, ts: prep.ts, sig }); const sv = await R1.wait(m => m.t === 'roomsaved'); assert(sv.hash && sv.at); ok('the owner\'s signature stores the room');
+
+  F1.send({ t: 'enter', space: 'room', who: ow.address.toLowerCase(), ...spawn }); const e2 = await F1.wait(m => m.t === 'entered'); assert(!e2.mine); assert.equal(e2.owner, ow.address.toLowerCase());
+  assert(e2.players.some(q => q.id === R1.id)); ok('a friend can visit a saved room and sees the owner there');
+  const d = e2.doc; assert.equal(d.theme, 'cyberpunk'); assert.equal(d.ambience, 'neon'); assert.equal(d.windows, false); assert.deepEqual(d.wall, { c: '#112233', pat: 'brick' }); assert(!d.floor); assert(!('custom' in d)); ok('the stored room keeps the valid settings and drops everything else');
+  assert.equal(d.pieces.length, 3); assert(d.pieces.every(q => !('img' in q) && !('k' in q) && !('y' in q))); const bed = d.pieces.find(q => q.p === 'bed'); assert.deepEqual(bed, { p: 'bed', x: 4.5, z: -3.5, ry: 90 }); ok('unknown pieces, images, scale and height are stripped; positions are clamped to the floor');
+  const wt2 = d.pieces.find(q => q.p === 'wallText'); assert(!/bad\.io|0xaaaa/.test(wt2.txt) && /HELLO/.test(wt2.txt) && wt2.c === '#ff00ff'); assert(!/evil|https/.test(d.name)); ok('links and wallet addresses are removed from room text');
+  const sawF = await R1.wait(m => m.t === 'join' && m.p.id === F1.id); ok('the owner sees the visitor arrive');
+  F1.send({ t: 'chat', text: 'nice place' }); await R1.wait(m => m.t === 'chat' && m.text === 'nice place'); ok('visitors and the owner chat inside the room');
+  await sleep(150); const p2 = await (async () => { R1.got.length = 0; R1.send({ t: 'roomprep', doc: Object.assign({}, doc, { name: 'Second look', pieces: doc.pieces.slice(0, 1) }) }); return R1.wait(m => m.t === 'roomprep'); })();
+  await sleep(150); R1.send({ t: 'roomsave', doc: Object.assign({}, doc, { name: 'Second look', pieces: doc.pieces.slice(0, 1) }), ts: p2.ts, sig: await ow.signMessage(p2.message) }); await R1.wait(m => m.t === 'roomsaved');
+  const live = await F1.wait(m => m.t === 'roomdoc'); assert.equal(live.doc.name, 'Second look'); ok('visitors receive the new look when the owner saves');
+
+  town.send({ t: 'enter', space: 'room', who: Wallet.createRandom().address, ...spawn }); const nf = await town.wait(m => m.t === 'roomfail'); assert(/not been saved/.test(nf.reason)); ok('visiting a room that was never saved is refused');
+  town.got.length = 0; town.send({ t: 'roomprep', doc }); const gp = await town.wait(m => m.t === 'roomfail'); assert(/wallet/.test(gp.reason)); ok('a guest cannot save a room');
+  await sleep(800); F1.send({ t: 'enter', space: 'city', x: -4.8, z: -2.35, ry: 0 }); const back = await F1.wait(m => m.t === 'entered' && m.space === 'city'); assert(back.players.some(q => q.id === wt.id)); ok('leaving a room returns to the town and its players');
+  await R1.wait(m => m.t === 'leave' && m.id === F1.id); ok('the room sees the visitor leave');
+  const big = client(); await big.open; await big.wait(m => m.t === 'welcome'); big.send({ t: 'chat', text: 'x'.repeat(5000) }); await sleep(150); assert(big.ws.readyState === 1); ok('oversized chat frames are ignored');
+
+  require('fs').rmSync(process.env.DATA_DIR, { recursive: true, force: true });
   console.log(`\nall ${n} checks passed`); process.exit(0);
 })().catch(e => { console.error('FAIL', e); process.exit(1); });

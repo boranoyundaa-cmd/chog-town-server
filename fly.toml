@@ -7,7 +7,12 @@ primary_region = "fra"            # Frankfurt: closest Fly region to Turkey
 
 [env]
   PORT = "8767"
+  DATA_DIR = "/data"                                                      # the mounted volume: saved rooms and reports survive deploys
   ALLOWED_ORIGINS = "https://chog-town.pages.dev,http://localhost:8766"   # the live game page and local dev
+
+[mounts]
+  source = "chog_data"
+  destination = "/data"
 
 [http_service]
   internal_port = 8767

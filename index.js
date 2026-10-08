@@ -8,7 +8,10 @@
 //   logout {}                           drop the wallet, become a guest again
 //   move {x, z, ry, mv}                 position report, ~10 per second
 //   chat {text}  report {id, reason}
-// Server -> client: welcome, authed, authfail, appear (full player), join, leave, state, snap, chat, sys.
+//   enter {space:'city'|'solo'|'room', who:'me'|addr|id, x, z, ry}   change space: the town, a private spot, or somebody's saved room (everything below is per space)
+//   roomprep {doc} -> roomprep {message, ts}     the cleaned room and the text the wallet must sign
+//   roomsave {doc, ts, sig}                      store the room if the wallet signed exactly that text
+// Server -> client: welcome, authed, authfail, appear (full player), join, leave, state, snap, chat, sys, entered, roomprep, roomsaved, roomfail, roomdoc.
 const http = require('http');
 const crypto = require('crypto');
 const fs = require('fs');
@@ -16,6 +19,7 @@ const path = require('path');
 const { WebSocketServer } = require('ws');
 const { verifyMessage } = require('ethers');
 const { clean } = require('./filter');
+const roomsLib = require('./rooms');
 
 const CFG = {
   port: +process.env.PORT || 8767,
@@ -26,11 +30,16 @@ const CFG = {
   speed: 2.7, tolerance: 1.6,                     // client walk speed and how much faster than that we still accept
   maxPlayers: +process.env.MAX_PLAYERS || 200, maxPerIp: +process.env.MAX_PER_IP || 6,
   tickMs: 100, pingMs: 20000, sessionMs: 12 * 3600e3,
+  roomPrepMs: +process.env.ROOM_PREP_MS || 1000, roomSaveMs: +process.env.ROOM_SAVE_MS || 3000,        // min time between room signatures / saves per player
   chatMax: 140, chatBurst: 3, chatWindowMs: 6000, spamMuteMs: 30e3,
   reportMuteAt: 3, reportMuteMs: 10 * 60e3, reportWindowMs: 10 * 60e3,
 };
-const DATA_DIR = path.join(__dirname, 'data');
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');          // on Fly this is a mounted volume (docs/engineering/server.md), otherwise rooms vanish on every deploy
 fs.mkdirSync(DATA_DIR, { recursive: true });
+const rooms = roomsLib.open(DATA_DIR);
+const [ROOM_W, ROOM_D] = roomsLib.LIMITS.size;
+const ROOM_LIMIT = [ROOM_W / 2 - 0.2, ROOM_D / 2 - 0.2];                         // walking limit on the room floor (the client keeps 0.3 off the walls)
+const limitsOf = space => (space.startsWith('city') ? [CFG.limit, CFG.limit] : ROOM_LIMIT);
 
 // ---------- state
 let nextId = 1;
@@ -44,7 +53,7 @@ const stats = { connected: 0, chat: 0, filtered: 0, reports: 0, snaps: 0 };
 const now = () => Date.now();
 const r2 = v => Math.round(v * 100) / 100;
 const send = (p, m) => { if (p.ws.readyState === 1) p.ws.send(JSON.stringify(m)); };
-const broadcast = (m, except) => { const s = JSON.stringify(m); for (const p of players.values()) if (p !== except && p.ws.readyState === 1) p.ws.send(s); };
+const bcast = (space, m, except) => { const s = JSON.stringify(m); for (const p of players.values()) if (p !== except && p.space === space && p.ws.readyState === 1) p.ws.send(s); };   // chat, movement and joins stay inside one space
 const sys = (p, text) => send(p, { t: 'sys', text });
 const pub = p => ({ id: p.id, name: p.name, token: p.token, x: r2(p.x), z: r2(p.z), ry: r2(p.ry), mv: p.mv ? 1 : 0 });
 const log = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a);
@@ -71,7 +80,7 @@ function setLook(p, token) {                       // token is already verified 
   }
   p.token = token || null;
   p.name = token ? `Chog #${token}` : p.guest;
-  broadcast({ t: 'appear', p: pub(p) });
+  bcast(p.space, { t: 'appear', p: pub(p) });
 }
 
 // ---------- chat: filter, rate limit, report
@@ -90,7 +99,7 @@ function onChat(p, raw) {
   stats.chat++;
   const line = { t: 'chat', id: p.id, name: p.name, token: p.token, text: msg, at: t };
   recent.push({ id: p.id, name: p.name, addr: p.addr, text: msg, at: t }); if (recent.length > 200) recent.shift();
-  broadcast(line);
+  bcast(p.space, line);
 }
 function onReport(p, m) {
   const t = now(), target = players.get(+m.id);
@@ -111,7 +120,8 @@ function onMove(p, m) {
   const x = +m.x, z = +m.z, ry = +m.ry;
   if (!Number.isFinite(x) || !Number.isFinite(z)) return;
   const t = now(), dt = Math.min(1, Math.max(0.05, (t - p.moveAt) / 1000)); p.moveAt = t;
-  let nx = Math.max(-CFG.limit, Math.min(CFG.limit, x)), nz = Math.max(-CFG.limit, Math.min(CFG.limit, z));
+  const [lx, lz] = limitsOf(p.space);
+  let nx = Math.max(-lx, Math.min(lx, x)), nz = Math.max(-lz, Math.min(lz, z));
   const maxD = CFG.speed * CFG.tolerance * dt + 0.35, d = Math.hypot(nx - p.x, nz - p.z);
   if (d > maxD) {                                                  // too fast: move as far as allowed and pull the client back
     const k = maxD / d; nx = p.x + (nx - p.x) * k; nz = p.z + (nz - p.z) * k;
@@ -120,12 +130,53 @@ function onMove(p, m) {
   p.x = nx; p.z = nz; p.ry = Number.isFinite(ry) ? ry : p.ry; p.mv = !!m.mv; p.dirty = true;
 }
 
+// ---------- spaces: the town, a private spot, or a saved room (presence, chat and movement never cross a space)
+const roomFail = (p, reason) => send(p, { t: 'roomfail', reason });
+function onEnter(p, m) {
+  const t = now(); if (t - p.lastEnter < 700) return; p.lastEnter = t;
+  let target, owner = null, rec = null;
+  if (m.space === 'city') target = 'city';
+  else if (m.space === 'solo') target = 'solo:' + p.id;
+  else if (m.space === 'room') {
+    if (m.who === 'me') { if (!p.addr) return roomFail(p, 'Sign in with your wallet to open your saved room.'); owner = p.addr; }
+    else if (typeof m.who === 'string' && /^0x[0-9a-fA-F]{40}$/.test(m.who)) owner = m.who.toLowerCase();
+    else if (Number.isFinite(+m.who)) { const q = players.get(+m.who); if (!q || !q.addr) return roomFail(p, 'That player has no saved room (no wallet connected).'); owner = q.addr; }
+    else return;
+    rec = rooms.get(owner);
+    if (!rec && owner !== p.addr) return roomFail(p, 'That room has not been saved yet.');
+    target = 'room:' + owner;
+  } else return;
+  const [lx, lz] = limitsOf(target), x = +m.x, z = +m.z, ry = +m.ry;
+  bcast(p.space, { t: 'leave', id: p.id }, p);
+  p.space = target; p.x = Number.isFinite(x) ? Math.max(-lx, Math.min(lx, x)) : 0; p.z = Number.isFinite(z) ? Math.max(-lz, Math.min(lz, z)) : 0; p.ry = Number.isFinite(ry) ? ry : 0; p.mv = false; p.moveAt = t; p.strikes = 0;
+  const host = owner && [...players.values()].find(q => q.addr === owner && q.token);
+  send(p, { t: 'entered', space: target.split(':')[0], x: r2(p.x), z: r2(p.z), ry: r2(p.ry), owner, mine: !!owner && owner === p.addr, ownerName: host ? host.name : null,
+    doc: rec ? rec.doc : null, savedAt: rec ? rec.savedAt : null, players: [...players.values()].filter(q => q !== p && q.space === target).map(pub) });
+  bcast(target, { t: 'join', p: pub(p) }, p);
+  log('enter', p.name, target);
+}
+function onRoomPrep(p, m) {
+  if (!p.addr) return roomFail(p, 'Connect and sign in with your wallet to save your room.');
+  const t = now(); if (t - p.lastPrep < CFG.roomPrepMs) return roomFail(p, 'Slow down a little.'); p.lastPrep = t;
+  try { const r = rooms.prepare(m.doc); send(p, { t: 'roomprep', message: r.message, ts: r.ts, n: r.doc.pieces.length }); } catch (e) { roomFail(p, 'That room could not be read.'); }
+}
+function onRoomSave(p, m) {
+  if (!p.addr) return roomFail(p, 'Connect and sign in with your wallet to save your room.');
+  const t = now(); if (t - p.lastSave < CFG.roomSaveMs) return roomFail(p, 'Slow down a little.'); p.lastSave = t;
+  try {
+    const rec = rooms.save(p.addr, m.doc, m.ts, m.sig);
+    send(p, { t: 'roomsaved', at: rec.savedAt, hash: rec.hash });
+    bcast('room:' + p.addr, { t: 'roomdoc', doc: rec.doc, savedAt: rec.savedAt }, p);       // visitors standing in the room see the new look
+    log('room saved', p.addr, rec.doc.pieces.length + ' pieces');
+  } catch (e) { roomFail(p, e.message); }
+}
+
 // ---------- connection
 const server = http.createServer((req, res) => {
   if (req.url === '/health') { res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' }); return res.end(JSON.stringify({ ok: true, online: players.size, ...stats })); }
   res.writeHead(404); res.end();
 });
-const wss = new WebSocketServer({ server, maxPayload: 2048, perMessageDeflate: false });
+const wss = new WebSocketServer({ server, maxPayload: 16384, perMessageDeflate: false });   // 2 KB for everything except a room document (checked per message)
 
 wss.on('connection', (ws, req) => {
   const ip = (req.headers['fly-client-ip'] || req.socket.remoteAddress || '?').toString().trim();      // fly-client-ip is set by Fly's proxy; x-forwarded-for is client-controlled, so it is not used
@@ -137,23 +188,27 @@ wss.on('connection', (ws, req) => {
 
   const id = nextId++, nonce = crypto.randomBytes(12).toString('hex');
   const p = {
-    id, ws, ip, nonce, addr: null, token: null, guest: 'Guest-' + String(1000 + (id * 7919) % 9000), name: '',
+    id, ws, ip, nonce, addr: null, token: null, space: 'city', lastEnter: 0, lastPrep: 0, lastSave: 0, guest: 'Guest-' + String(1000 + (id * 7919) % 9000), name: '',
     x: 0.5 + (Math.random() - 0.5) * 0.8, z: 2.0 + (Math.random() - 0.5) * 0.8, ry: 0.6, mv: false, dirty: false, moveAt: now(), strikes: 0,
     chatTimes: [], lastText: '', lastAt: 0, mutedUntil: 0, reports: [], lastReport: 0, alive: true, authBusy: false,
   };
   p.name = p.guest; players.set(id, p); stats.connected++;
-  send(p, { t: 'welcome', id, name: p.name, challenge: challengeText(nonce), players: [...players.values()].filter(q => q !== p).map(pub), you: pub(p), maxChat: CFG.chatMax });
-  broadcast({ t: 'join', p: pub(p) }, p);
+  send(p, { t: 'welcome', id, name: p.name, challenge: challengeText(nonce), players: [...players.values()].filter(q => q !== p && q.space === 'city').map(pub), you: pub(p), maxChat: CFG.chatMax, rooms: 1 });
+  bcast('city', { t: 'join', p: pub(p) }, p);
   log('join', p.name, `(${players.size} online)`);
 
   ws.on('pong', () => { p.alive = true; });
   ws.on('message', async data => {
     let m; try { m = JSON.parse(data.toString()); } catch (e) { return; }
     if (!m || typeof m.t !== 'string') return;
+    if (data.length > 2048 && m.t !== 'roomprep' && m.t !== 'roomsave') return;
     try {
       if (m.t === 'move') return onMove(p, m);
       if (m.t === 'chat') return onChat(p, m.text);
       if (m.t === 'report') return onReport(p, m);
+      if (m.t === 'enter') return onEnter(p, m);
+      if (m.t === 'roomprep') return onRoomPrep(p, m);
+      if (m.t === 'roomsave') return onRoomSave(p, m);
       if (m.t === 'logout') { p.addr = null; return setLook(p, null); }
       if (m.t === 'auth') {
         if (p.authBusy) return; p.authBusy = true;
@@ -182,15 +237,15 @@ wss.on('connection', (ws, req) => {
   ws.on('close', () => {
     players.delete(id); if (p.token && byToken.get(p.token) === p) byToken.delete(p.token);
     const n = (ipCount.get(ip) || 1) - 1; if (n > 0) ipCount.set(ip, n); else ipCount.delete(ip);
-    broadcast({ t: 'leave', id }); log('leave', p.name, `(${players.size} online)`);
+    bcast(p.space, { t: 'leave', id }); log('leave', p.name, `(${players.size} online)`);
   });
   ws.on('error', () => { });
 });
 
 // ---------- loops
 setInterval(() => {                                    // 10 Hz: send only the players that moved since the last tick
-  const moved = []; for (const p of players.values()) if (p.dirty) { moved.push([p.id, r2(p.x), r2(p.z), r2(p.ry), p.mv ? 1 : 0]); p.dirty = false; }
-  if (moved.length) broadcast({ t: 'state', p: moved });
+  const moved = new Map(); for (const p of players.values()) if (p.dirty) { if (!moved.has(p.space)) moved.set(p.space, []); moved.get(p.space).push([p.id, r2(p.x), r2(p.z), r2(p.ry), p.mv ? 1 : 0]); p.dirty = false; }
+  for (const [space, list] of moved) bcast(space, { t: 'state', p: list });
 }, CFG.tickMs);
 setInterval(() => {                                    // drop dead sockets, expire sessions
   for (const p of players.values()) { if (!p.alive) { p.ws.terminate(); continue; } p.alive = false; try { p.ws.ping(); } catch (e) { /* closing */ } }
