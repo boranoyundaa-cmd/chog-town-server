@@ -101,7 +101,7 @@ function onReport(p, m) {
   if (!target.reports.some(r => r.by === p.id)) target.reports.push({ by: p.id, at: t });
   const entry = { at: new Date(t).toISOString(), reporter: { id: p.id, name: p.name, addr: p.addr }, target: { id: target.id, name: target.name, addr: target.addr }, reason: String(m.reason || '').slice(0, 200), context: recent.filter(r => r.id === target.id).slice(-5) };
   fs.appendFile(path.join(DATA_DIR, 'reports.jsonl'), JSON.stringify(entry) + '\n', () => { });
-  log('report', p.name, '->', target.name, entry.reason);
+  log('report', JSON.stringify(entry));                                      // also in the platform logs: the container disk is not persistent
   sys(p, 'Thanks. Your report was sent to the moderators.');
   if (target.reports.length >= CFG.reportMuteAt && target.mutedUntil < t + CFG.reportMuteMs) { target.mutedUntil = t + CFG.reportMuteMs; sys(target, 'Several players reported you. You are muted for 10 minutes.'); }
 }
