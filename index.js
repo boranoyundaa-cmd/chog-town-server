@@ -11,6 +11,11 @@
 //   enter {space:'city'|'solo'|'room', who:'me'|addr, inv?, x, z, ry}   change space: the town, a private spot, or a saved Home (the owner's, or one you were invited to by a direct invitation or the link token `inv`)
 //   enter {space:'hotel', floor}        the Chog Hotel: floor 0 is the lobby;  enter {space:'venue', id}: a hotel venue (a room document)
 //   hotelinfo {} -> hotel {floors, venues, counts}   the directory;  counts {c:{venueId:n}} is pushed to players in the hotel when people come and go
+//   hotelfloor {floor} -> facades {floor, items}      the facade documents on one floor (sent when a player steps onto it)
+//   venueinfo {} -> venueinfo {tier, points, templates, mine}      the wallet's license and venue (checked on chain, cached)
+//   venuemake {name, cat, desc} -> venuemine {mine}                activate a venue from the license: it starts CLOSED
+//   venueprep {doc} / venuesave {doc, ts, sig}     the venue room (a signed document, like a Home, with the tier's budget);  facadeprep / facadesave the same for the corridor facade
+//   venueset {open?, rule?, guests?, bans?, name?, cat?, desc?} -> venuemine {mine}   open or close it, the entry rule and lists, the listing text
 //   invite {id}                         invite a player to your saved Home (30 minutes)  ->  they get invited {owner, from}
 //   invlink {renew?} -> invlink {token, exp}     your Home's share link token (renew = revoke the old link)
 //   roomprep {doc} -> roomprep {message, ts}     the cleaned room and the text the wallet must sign
@@ -25,7 +30,8 @@ const { verifyMessage } = require('ethers');
 const { clean } = require('./filter');
 const roomsLib = require('./rooms');
 const invitesLib = require('./invites');
-const hotel = require('./hotel');
+const hotelLib = require('./hotel');
+const licenseLib = require('./license');
 
 const CFG = {
   port: +process.env.PORT || 8767,
@@ -44,10 +50,16 @@ const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');          
 fs.mkdirSync(DATA_DIR, { recursive: true });
 const rooms = roomsLib.open(DATA_DIR);
 const invites = invitesLib.open(DATA_DIR);
+const hotel = hotelLib.open(DATA_DIR);
 const [ROOM_W, ROOM_D] = roomsLib.LIMITS.size;
 const ROOM_LIMIT = [ROOM_W / 2 - 0.2, ROOM_D / 2 - 0.2];                         // walking limit on the room floor (the client keeps 0.3 off the walls)
 const HOTEL_LOBBY = [5.3, 3.8], HOTEL_FLOOR = [7.4, 7.4];                         // walking limits in the hotel lobby and on a floor (HOTEL in prototype/js/hotel.js)
-const limitsOf = space => (space.startsWith('city') ? [CFG.limit, CFG.limit] : space === 'hotel:0' ? HOTEL_LOBBY : space.startsWith('hotel:') ? HOTEL_FLOOR : ROOM_LIMIT);
+const limitsOf = space => {
+  if (space.startsWith('city')) return [CFG.limit, CFG.limit];
+  if (space === 'hotel:0') return HOTEL_LOBBY; if (space.startsWith('hotel:')) return HOTEL_FLOOR;
+  if (space.startsWith('venue:')) { const v = hotel.get(space.slice(6)); if (v) { const [w, d] = hotel.sizeOf(v); return [w / 2 - 0.2, d / 2 - 0.2]; } }
+  return ROOM_LIMIT;
+};
 const venueCounts = () => { const c = {}; for (const q of players.values()) if (q.space.startsWith('venue:')) c[q.space.slice(6)] = (c[q.space.slice(6)] || 0) + 1; return c; };   // real players only
 
 // ---------- state
@@ -78,6 +90,23 @@ async function ownerOf(token) {
     return '0x' + j.result.slice(-40).toLowerCase();
   } finally { clearTimeout(timer); }
 }
+async function rpcCall(body) {
+  const ctl = new AbortController(), timer = setTimeout(() => ctl.abort(), 8000);
+  try { const r = await fetch(CFG.rpc, { method: 'POST', signal: ctl.signal, headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }); return await r.json(); } finally { clearTimeout(timer); }
+}
+const addrOf = hex => '0x' + hex.slice(-40).toLowerCase();
+const chain = {                                    // what the license needs from the chain
+  async balanceOf(addr) { const j = await rpcCall({ jsonrpc: '2.0', id: 1, method: 'eth_call', params: [{ to: CFG.nft, data: '0x70a08231' + addr.slice(2).padStart(64, '0') }, 'latest'] }); if (!j.result) throw new Error('no result'); return parseInt(j.result, 16); },
+  async ownersOf(ids) {                            // one batched request per 100 tokens; a token the chain cannot answer counts as nobody's
+    const out = [];
+    for (let i = 0; i < ids.length; i += 100) {
+      const part = ids.slice(i, i + 100), j = await rpcCall(part.map((id, k) => ({ jsonrpc: '2.0', id: k, method: 'eth_call', params: [{ to: CFG.nft, data: '0x6352211e' + id.toString(16).padStart(64, '0') }, 'latest'] })));
+      const rows = Array.isArray(j) ? j : [j]; const by = new Map(rows.map(r => [r.id, r])); part.forEach((_, k) => { const r = by.get(k); out.push(r && r.result ? addrOf(r.result) : null); });
+    }
+    return out;
+  },
+};
+const license = licenseLib.open(chain);
 const challengeText = nonce => `Chog Town sign-in\nThis proves you control this wallet. It costs nothing and sends no transaction.\nNonce: ${nonce}`;
 
 function setLook(p, token) {                       // token is already verified (or null for the default Chog)
@@ -161,14 +190,15 @@ function onEnter(p, m) {
     target = 'hotel:' + f;
   } else if (m.space === 'venue') {
     venue = hotel.get(String(m.id)); if (!venue) return roomFail(p, 'That room does not exist.');
-    target = 'venue:' + venue.id; rec = { doc: venue.doc, savedAt: null };
+    const why = hotel.entry(venue, p); if (why) return roomFail(p, why);
+    owner = venue.addr || null; target = 'venue:' + venue.id; rec = { doc: venue.doc, savedAt: null };
   } else return;
   const [lx, lz] = limitsOf(target), x = +m.x, z = +m.z, ry = +m.ry;
   bcast(p.space, { t: 'leave', id: p.id }, p);
   p.space = target; p.x = Number.isFinite(x) ? Math.max(-lx, Math.min(lx, x)) : 0; p.z = Number.isFinite(z) ? Math.max(-lz, Math.min(lz, z)) : 0; p.ry = Number.isFinite(ry) ? ry : 0; p.mv = false; p.moveAt = t; p.strikes = 0;
   const host = owner && [...players.values()].find(q => q.addr === owner && q.token);
   send(p, { t: 'entered', space: target.split(':')[0], x: r2(p.x), z: r2(p.z), ry: r2(p.ry), owner, mine: !!owner && owner === p.addr, ownerName: host ? host.name : null,
-    doc: rec ? rec.doc : null, savedAt: rec ? rec.savedAt : null, floor: target.startsWith('hotel:') ? +target.slice(6) : undefined, venue: venue ? { id: venue.id, no: venue.no, floor: venue.floor, name: venue.name, cat: venue.cat, desc: venue.desc, by: venue.by } : undefined, counts: target.startsWith('hotel:') ? venueCounts() : undefined, players: [...players.values()].filter(q => q !== p && q.space === target).map(pub) });
+    doc: rec ? rec.doc : null, savedAt: rec ? rec.savedAt : null, floor: target.startsWith('hotel:') ? +target.slice(6) : undefined, venue: venue ? { id: venue.id, no: venue.no, floor: venue.floor, span: venue.span || 1, name: venue.name, cat: venue.cat, desc: venue.desc, by: venue.by, state: venue.state, size: hotel.sizeOf(venue) } : undefined, counts: target.startsWith('hotel:') ? venueCounts() : undefined, players: [...players.values()].filter(q => q !== p && q.space === target).map(pub) });
   bcast(target, { t: 'join', p: pub(p) }, p);
   log('enter', p.name, target);
 }
@@ -202,6 +232,53 @@ function onRoomSave(p, m) {
   } catch (e) { roomFail(p, e.message); }
 }
 
+// ---------- venues: the license, activation, the signed room and facade, open and close (docs/game/world.md)
+const hotelPush = () => { const m = { t: 'hotel', floors: hotel.floors(), venues: hotel.list(), counts: venueCounts() }; for (const q of players.values()) if (q.space.startsWith('hotel:')) send(q, m); };
+async function ownLicense(p, fresh) {
+  if (!p.addr) throw new Error('Connect and sign in with your wallet first.');
+  try { return await license.get(p.addr, fresh); } catch (e) { throw new Error('Could not check the chain just now. Try again in a moment.'); }
+}
+async function onVenueInfo(p) {
+  const t = now(); if (t - p.lastVenue < 1000) return; p.lastVenue = t;
+  const L = await ownLicense(p, false);
+  send(p, { t: 'venueinfo', tier: L.tier, points: L.points, tokens: L.tokens.length, templates: hotelLib.TEMPLATES, mine: hotel.mine(p.addr) });
+}
+async function onVenueMake(p, m) {
+  const t = now(); if (t - p.lastVenue < 1000) return; p.lastVenue = t;
+  const L = await ownLicense(p, true);
+  if (!L.tier) return roomFail(p, 'You need a Chog to open a venue.');
+  const v = hotel.activate(p.addr, L.tier, { name: m.name, cat: m.cat, desc: m.desc, by: p.username || p.name });
+  log('venue activated', p.addr, 'tier', L.tier, '#' + v.no);
+  send(p, { t: 'venuemine', mine: hotel.mine(p.addr) }); hotelPush();
+}
+function onVenueSet(p, m) {
+  if (!p.addr || !hotel.byOwner(p.addr)) return roomFail(p, 'You have no venue yet.');
+  const t = now(); if (t - p.lastVenue < 400) return; p.lastVenue = t;
+  const before = JSON.stringify(hotel.list().find(v => v.id === hotel.byOwner(p.addr).id));
+  hotel.update(p.addr, { open: m.open === undefined ? undefined : !!m.open, rule: m.rule, guests: m.guests, bans: m.bans, name: m.name, cat: m.cat, desc: m.desc });
+  const v = hotel.byOwner(p.addr);
+  send(p, { t: 'venuemine', mine: hotel.mine(p.addr) });
+  if (JSON.stringify(hotel.list().find(x => x.id === v.id)) !== before) hotelPush();
+  if (v.state !== 'open') for (const q of players.values()) if (q.space === 'venue:' + v.id && q.addr !== p.addr) { q.space = 'hotel:' + v.floor; send(q, { t: 'sys', text: 'The venue was closed by its owner.' }); }
+}
+const venueStore = kind => (kind === 'facade' ? hotel.facades : hotel.docs), venueLim = (kind, v) => (kind === 'facade' ? hotel.facadeLimits(v) : hotel.limitsOf(v));
+function onVenuePrep(p, m, kind) {
+  const v = p.addr && hotel.byOwner(p.addr); if (!v) return roomFail(p, 'You have no venue yet.');
+  const t = now(); if (t - p.lastPrep < CFG.roomPrepMs) return roomFail(p, 'Slow down a little.'); p.lastPrep = t;
+  try { const r = venueStore(kind).prepare(m.doc, venueLim(kind, v)); send(p, { t: kind + 'prep', message: r.message, ts: r.ts, n: r.doc.pieces.length }); } catch (e) { roomFail(p, 'That could not be read.'); }
+}
+function onVenueSave(p, m, kind) {
+  const v = p.addr && hotel.byOwner(p.addr); if (!v) return roomFail(p, 'You have no venue yet.');
+  const t = now(); if (t - p.lastSave < CFG.roomSaveMs) return roomFail(p, 'Slow down a little.'); p.lastSave = t;
+  try {
+    const rec = venueStore(kind).save(p.addr, m.doc, m.ts, m.sig, venueLim(kind, v));
+    send(p, { t: kind + 'saved', at: rec.savedAt, hash: rec.hash, mine: hotel.mine(p.addr) });
+    if (kind === 'venue') bcast('venue:' + v.id, { t: 'roomdoc', doc: rec.doc, savedAt: rec.savedAt }, p);
+    else for (const q of players.values()) if (q.space === 'hotel:' + v.floor) send(q, { t: 'facades', floor: v.floor, items: hotel.facadesOn(v.floor) });
+    log(kind + ' saved', p.addr, rec.doc.pieces.length + ' pieces');
+  } catch (e) { roomFail(p, e.message); }
+}
+
 // ---------- connection
 const server = http.createServer((req, res) => {
   if (req.url === '/health') { res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' }); return res.end(JSON.stringify({ ok: true, online: players.size, ...stats })); }
@@ -219,7 +296,7 @@ wss.on('connection', (ws, req) => {
 
   const id = nextId++, nonce = crypto.randomBytes(12).toString('hex');
   const p = {
-    id, ws, ip, nonce, addr: null, token: null, space: 'city', lastEnter: 0, lastPrep: 0, lastSave: 0, lastInvite: 0, invitedTo: new Map(), guest: 'Guest-' + String(1000 + (id * 7919) % 9000), name: '',
+    id, ws, ip, nonce, addr: null, token: null, space: 'city', lastEnter: 0, lastPrep: 0, lastSave: 0, lastInvite: 0, lastVenue: 0, username: null, invitedTo: new Map(), guest: 'Guest-' + String(1000 + (id * 7919) % 9000), name: '',
     x: 0.5 + (Math.random() - 0.5) * 0.8, z: 2.0 + (Math.random() - 0.5) * 0.8, ry: 0.6, mv: false, dirty: false, moveAt: now(), strikes: 0,
     chatTimes: [], lastText: '', lastAt: 0, mutedUntil: 0, reports: [], lastReport: 0, alive: true, authBusy: false,
   };
@@ -232,13 +309,21 @@ wss.on('connection', (ws, req) => {
   ws.on('message', async data => {
     let m; try { m = JSON.parse(data.toString()); } catch (e) { return; }
     if (!m || typeof m.t !== 'string') return;
-    if (data.length > 2048 && m.t !== 'roomprep' && m.t !== 'roomsave') return;
+    if (data.length > 2048 && !['roomprep', 'roomsave', 'venueprep', 'venuesave', 'facadeprep', 'facadesave'].includes(m.t)) return;
     try {
       if (m.t === 'move') return onMove(p, m);
       if (m.t === 'chat') return onChat(p, m.text);
       if (m.t === 'report') return onReport(p, m);
       if (m.t === 'enter') return onEnter(p, m);
       if (m.t === 'hotelinfo') return send(p, { t: 'hotel', floors: hotel.floors(), venues: hotel.list(), counts: venueCounts() });
+      if (m.t === 'hotelfloor') { const f = Math.floor(+m.floor); return send(p, { t: 'facades', floor: f, items: hotel.facadesOn(f) }); }
+      if (m.t === 'venueinfo') return await onVenueInfo(p);
+      if (m.t === 'venuemake') return await onVenueMake(p, m);
+      if (m.t === 'venueset') return onVenueSet(p, m);
+      if (m.t === 'venueprep') return onVenuePrep(p, m, 'venue');
+      if (m.t === 'venuesave') return onVenueSave(p, m, 'venue');
+      if (m.t === 'facadeprep') return onVenuePrep(p, m, 'facade');
+      if (m.t === 'facadesave') return onVenueSave(p, m, 'facade');
       if (m.t === 'invite') return onInvite(p, m);
       if (m.t === 'invlink') return onInvLink(p, m);
       if (m.t === 'roomprep') return onRoomPrep(p, m);
@@ -266,7 +351,7 @@ wss.on('connection', (ws, req) => {
         if (owner !== p.addr) return send(p, { t: 'sys', text: `Chog #${token} is not in your wallet.` });
         return setLook(p, token);
       }
-    } catch (e) { log('handler error', e.message); }
+    } catch (e) { log('handler error', e.message); if (/^(You |Connect |Decorate |Could not check)/.test(e.message)) roomFail(p, e.message); }
   });
   ws.on('close', () => {
     players.delete(id); if (p.token && byToken.get(p.token) === p) byToken.delete(p.token);
