@@ -2,7 +2,7 @@ FROM node:22-alpine
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
-COPY index.js filter.js rooms.js invites.js hotel.js license.js users.js room_catalog.json seed_venues.json license_data.json ./
+COPY index.js filter.js rooms.js invites.js hotel.js license.js users.js games.js exhibition.js shop.js shop_items.json room_catalog.json seed_venues.json license_data.json ./
 RUN apk add --no-cache su-exec && mkdir -p /app/data && chown node:node /app/data
 ENV NODE_ENV=production PORT=8767
 EXPOSE 8767

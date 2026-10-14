@@ -1,5 +1,5 @@
 'use strict';
-// Chog Town realtime server: presence (who is where) and chat. It holds no money and no ownership;
+// Chog Hotel realtime server: presence (who is where) and chat. It holds no money and no ownership;
 // the only thing it takes from the chain is "does this wallet own this Chog" (eth_call ownerOf), and it never signs anything.
 //
 // Protocol (JSON text frames). Client -> server:
@@ -9,14 +9,21 @@
 //   move {x, z, ry, mv}                 position report, ~10 per second
 //   chat {text}  report {id, reason}
 //   enter {space:'city'|'solo'|'room', who:'me'|addr, inv?, x, z, ry}   change space: the town, a private spot, or a saved Home (the owner's, or one you were invited to by a direct invitation or the link token `inv`)
-//   enter {space:'hotel', floor}        the Chog Hotel: floor 0 is the lobby;  enter {space:'venue', id}: a hotel venue (a room document)
+//   enter {space:'hotel', floor}        the Chog Hotel: floor 0 is the lobby;  enter {space:'venue', id, level?}: a hotel venue (a room document; level 2 = upstairs, tiers 3 and 4)
 //   hotelinfo {} -> hotel {floors, venues, counts}   the directory;  counts {c:{venueId:n}} is pushed to players in the hotel when people come and go
 //   hotelfloor {floor} -> facades {floor, items}      the facade documents on one floor (sent when a player steps onto it)
 //   usernameprep {name} -> usernameprep {message, ts} / usernamesave {name, ts, sig} -> username {name}   claim a unique username with the wallet (guest lists use it)
 //   venueinfo {} -> venueinfo {tier, points, templates, mine}      the wallet's license and venue (checked on chain, cached)
 //   venuemake {name, cat, desc} -> venuemine {mine}                activate a venue from the license: it starts CLOSED
-//   venueprep {doc} / venuesave {doc, ts, sig}     the venue room (a signed document, like a Home, with the tier's budget);  facadeprep / facadesave the same for the corridor facade
+//   venueprep {doc, level?} / venuesave {doc, ts, sig, level?}     the venue room (a signed document, like a Home, with the tier's budget; level 2 is the upper room);  facadeprep / facadesave the same for the hall facade
 //   venueset {open?, rule?, guests?, bans?, name?, cat?, desc?} -> venuemine {mine}   open or close it, the entry rule and lists, the listing text
+//   venuemove {} -> venuemine {mine, moved}          upgrade, move to a smaller room, or take the archived venue back (the license decides the tier); venueinfo / venuemine also carry {offer, archived}
+//   ex_list {} -> ex_list {week, entries, winner, you, trophies};  ex_prep {} / ex_submit {ts, sig} (enter the weekly Home contest with a snapshot of your saved Home);  ex_voteprep {id} / ex_vote {id, ts, sig};  -> ex_prep / ex_voteprep {message, ts}, ex_done, ex_fail {reason}  (exhibition.js)
+//   enter {space:'hotel', floor:'E'}    the Exhibition floor;  enter {space:'exhibit', id}: one contest entry (a read-only snapshot, entered.exhibit)
+//   shopget {} / shopnotice {tx?} -> shopstate {mode, address, owned, equip, events, camera, budget}   what the wallet owns in the shop (balanceOfBatch, cached); the notice is sent after a purchase and forces a fresh read
+//   shopbuy {id, qty} (SHOP_MOCK=1 only)   record a mock purchase;   equip {slot, id|null}   wear or take off a cosmetic in an extra slot (others see it: `cos` in every player record)
+//   eventstart {title, mega?}           announce a 24 h event at your open venue (uses up an Event pass)  ->  events {list} to everybody;  camopen {} / camclose {} -> camera {init, size, pieces} then camera {players} every second (security camera item)
+//   tip {venueId, amount, tx}           tell the venue you tipped its owner (the server checks the Tip event of the transaction)  ->  tipped {name, amount, venue} to everybody inside
 //   invite {id}                         invite a player to your saved Home (30 minutes)  ->  they get invited {owner, from}
 //   invlink {renew?} -> invlink {token, exp}     your Home's share link token (renew = revoke the old link)
 //   roomprep {doc} -> roomprep {message, ts}     the cleaned room and the text the wallet must sign
@@ -34,6 +41,9 @@ const invitesLib = require('./invites');
 const hotelLib = require('./hotel');
 const licenseLib = require('./license');
 const usersLib = require('./users');
+const gamesLib = require('./games');
+const exhibitionLib = require('./exhibition');
+const shopLib = require('./shop');
 
 const CFG = {
   port: +process.env.PORT || 8767,
@@ -52,22 +62,28 @@ const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');          
 fs.mkdirSync(DATA_DIR, { recursive: true });
 const rooms = roomsLib.open(DATA_DIR);
 const invites = invitesLib.open(DATA_DIR);
-const hotel = hotelLib.open(DATA_DIR);
+const clock = { skew: 0 };                                                       // tests move time with clock.skew (venue freeze and expiry)
+const shop = shopLib.open(DATA_DIR, { now: () => Date.now() + clock.skew, rpc: CFG.rpc });                  // the shop (shop.js): SHOP_ADDRESS / SHOP_MOCK from the environment
+const hotel = hotelLib.open(DATA_DIR, { now: () => Date.now() + clock.skew, shop });
 const users = usersLib.open(DATA_DIR);
 const [ROOM_W, ROOM_D] = roomsLib.LIMITS.size;
 const ROOM_LIMIT = [ROOM_W / 2 - 0.2, ROOM_D / 2 - 0.2];                         // walking limit on the room floor (the client keeps 0.3 off the walls)
-const HOTEL_LOBBY = [5.3, 3.8], HOTEL_FLOOR = [7.4, 7.4];                         // walking limits in the hotel lobby and on a floor (HOTEL in prototype/js/hotel.js)
+const HOTEL_LOBBY = [5.3, 3.8], HOTEL_FLOOR = [7.8, 7.8];                         // walking limits in the hotel lobby and on a floor (HOTEL in prototype/js/hotel.js: a 16 x 16 m hall)
+const venueSpace = (id, level) => 'venue:' + id + (level === 2 ? '#2' : ''), venueIdOf = space => space.slice(6).split('#')[0];      // a venue's upper level is a space of its own (presence and chat per level)
 const limitsOf = space => {
   if (space.startsWith('city')) return [CFG.limit, CFG.limit];
   if (space === 'hotel:0') return HOTEL_LOBBY; if (space.startsWith('hotel:')) return HOTEL_FLOOR;
-  if (space.startsWith('venue:')) { const v = hotel.get(space.slice(6)); if (v) { const [w, d] = hotel.sizeOf(v); return [w / 2 - 0.2, d / 2 - 0.2]; } }
+  if (space.startsWith('venue:')) { const v = hotel.get(venueIdOf(space)); if (v) { const [w, d] = hotel.sizeOf(v); return [w / 2 - 0.2, d / 2 - 0.2]; } }
   return ROOM_LIMIT;
 };
-const venueCounts = () => { const c = {}; for (const q of players.values()) if (q.space.startsWith('venue:')) c[q.space.slice(6)] = (c[q.space.slice(6)] || 0) + 1; return c; };   // real players only
+const insideCount = (id, except) => { let n = 0; for (const q of players.values()) if (q !== except && q.space.startsWith('venue:') && venueIdOf(q.space) === id) n++; return n; };      // people inside a venue, both levels, not counting `except`
+const venueCounts = () => { const c = {}; for (const q of players.values()) if (q.space.startsWith('venue:')) { const id = venueIdOf(q.space); c[id] = (c[id] || 0) + 1; } return c; };   // real players only, both levels together
 
 // ---------- state
 let nextId = 1;
 const players = new Map();            // id -> player
+const exhibition = exhibitionLib.open(DATA_DIR, { now: () => Date.now() + clock.skew, rooms, users });     // the weekly Home contest (exhibition.js)
+const games = gamesLib.open(DATA_DIR, { players });     // mini-games: score book and the two-player referee (games.js)
 const byToken = new Map();            // verified token id -> player (one session per Chog)
 const sessions = new Map();           // session secret -> { addr, exp }
 const ipCount = new Map();
@@ -79,7 +95,7 @@ const r2 = v => Math.round(v * 100) / 100;
 const send = (p, m) => { if (p.ws.readyState === 1) p.ws.send(JSON.stringify(m)); };
 const bcast = (space, m, except) => { const s = JSON.stringify(m); for (const p of players.values()) if (p !== except && p.space === space && p.ws.readyState === 1) p.ws.send(s); };   // chat, movement and joins stay inside one space
 const sys = (p, text) => send(p, { t: 'sys', text });
-const pub = p => ({ id: p.id, name: p.name, token: p.token, x: r2(p.x), z: r2(p.z), ry: r2(p.ry), mv: p.mv ? 1 : 0 });
+const pub = p => ({ id: p.id, name: p.name, token: p.token, x: r2(p.x), z: r2(p.z), ry: r2(p.ry), mv: p.mv ? 1 : 0, cos: p.cosm || undefined });      // cos: the cosmetics worn in the extra slots (shop.js)
 const log = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a);
 
 // ---------- chain: owner of a token (raw JSON-RPC, no library)
@@ -110,7 +126,7 @@ const chain = {                                    // what the license needs fro
   },
 };
 const license = licenseLib.open(chain);
-const challengeText = nonce => `Chog Town sign-in\nThis proves you control this wallet. It costs nothing and sends no transaction.\nNonce: ${nonce}`;
+const challengeText = nonce => `Chog Hotel sign-in\nThis proves you control this wallet. It costs nothing and sends no transaction.\nNonce: ${nonce}`;
 
 // what everyone sees: the claimed username, else the Chog they play as, else the automatic guest name
 const shownName = p => p.username || (p.token ? `Chog #${p.token}` : p.guest);
@@ -178,7 +194,7 @@ const roomFail = (p, reason) => send(p, { t: 'roomfail', reason });
 const invited = (p, owner, token) => (p.invitedTo.get(owner) || 0) > now() || invites.check(token, owner, now());
 function onEnter(p, m) {
   const t = now(); if (t - p.lastEnter < 400) return; p.lastEnter = t;
-  let target, owner = null, rec = null, venue = null;
+  let target, owner = null, rec = null, venue = null, level = 1, exhibit = null;
   if (m.space === 'city') target = 'city';
   else if (m.space === 'solo') target = 'solo:' + p.id;
   else if (m.space === 'room') {
@@ -191,19 +207,23 @@ function onEnter(p, m) {
     if (!rec && owner !== p.addr) return roomFail(p, 'That Home is not ready yet.');
     target = 'room:' + owner;
   } else if (m.space === 'hotel') {
-    const f = Math.floor(+m.floor); if (!(f >= 0 && f <= hotel.floors())) return roomFail(p, 'There is no such floor.');
+    const f = m.floor === 'E' ? 'E' : Math.floor(+m.floor); if (f !== 'E' && !(f >= 0 && f <= hotel.floors())) return roomFail(p, 'There is no such floor.');      // 'E' = the Exhibition floor
     target = 'hotel:' + f;
+  } else if (m.space === 'exhibit') {                                            // a contest entry: the snapshot of a Home, read only
+    exhibit = exhibition.view(String(m.id)); if (!exhibit) return roomFail(p, 'That entry is not in the contest any more.');
+    target = 'exhibit:' + exhibit.id; rec = { doc: exhibit.doc, savedAt: exhibit.at };
   } else if (m.space === 'venue') {
     venue = hotel.get(String(m.id)); if (!venue) return roomFail(p, 'That room does not exist.');
-    const why = hotel.entry(venue, p); if (why) return roomFail(p, why);
-    owner = venue.addr || null; target = 'venue:' + venue.id; rec = { doc: venue.doc, savedAt: null };
+    level = +m.level === 2 ? 2 : 1; if (level === 2 && (venue.levels || 1) < 2) return roomFail(p, 'There is no upper level here.');
+    const why = hotel.entry(venue, p, { level, count: insideCount(venue.id, p) }); if (why) return roomFail(p, why);
+    owner = venue.addr || null; target = venueSpace(venue.id, level); rec = { doc: level === 2 ? venue.doc2 : venue.doc, savedAt: null };
   } else return;
   const [lx, lz] = limitsOf(target), x = +m.x, z = +m.z, ry = +m.ry;
   bcast(p.space, { t: 'leave', id: p.id }, p);
   p.space = target; p.x = Number.isFinite(x) ? Math.max(-lx, Math.min(lx, x)) : 0; p.z = Number.isFinite(z) ? Math.max(-lz, Math.min(lz, z)) : 0; p.ry = Number.isFinite(ry) ? ry : 0; p.mv = false; p.moveAt = t; p.strikes = 0;
   const host = owner && [...players.values()].find(q => q.addr === owner && q.token);
   send(p, { t: 'entered', space: target.split(':')[0], x: r2(p.x), z: r2(p.z), ry: r2(p.ry), owner, mine: !!owner && owner === p.addr, ownerName: host ? host.name : null,
-    doc: rec ? rec.doc : null, savedAt: rec ? rec.savedAt : null, floor: target.startsWith('hotel:') ? +target.slice(6) : undefined, venue: venue ? { id: venue.id, no: venue.no, floor: venue.floor, span: venue.span || 1, name: venue.name, cat: venue.cat, desc: venue.desc, by: venue.by, state: venue.state, size: hotel.sizeOf(venue), limit: venue.addr ? hotelLib.TEMPLATES[venue.tier].pieces : 60 } : undefined, counts: target.startsWith('hotel:') ? venueCounts() : undefined, players: [...players.values()].filter(q => q !== p && q.space === target).map(pub) });
+    doc: rec ? rec.doc : null, savedAt: rec ? rec.savedAt : null, floor: target.startsWith('hotel:') ? (target === 'hotel:E' ? 'E' : +target.slice(6)) : undefined, exhibit: exhibit ? { id: exhibit.id, name: exhibit.name, by: exhibit.by, theme: exhibit.theme, week: exhibit.week, current: exhibit.current, size: roomsLib.LIMITS.size } : undefined, level: venue ? level : undefined, venue: venue ? { id: venue.id, no: venue.no, floor: venue.floor, span: venue.span || 1, levels: venue.levels || 1, name: venue.name, cat: venue.cat, desc: venue.desc, by: venue.by, state: venue.state, tier: venue.tier || 0, cap: hotel.capOf(venue), music: venue.music || '', vip: venue.vipRule && venue.vipRule !== 'public' ? venue.vipRule : null, size: hotel.sizeOf(venue), limit: hotel.piecesOf(venue), lights: hotel.lightsOf(venue) } : undefined, counts: target.startsWith('hotel:') ? venueCounts() : undefined, players: [...players.values()].filter(q => q !== p && q.space === target).map(pub) });
   bcast(target, { t: 'join', p: pub(p) }, p);
   log('enter', p.name, target);
 }
@@ -221,16 +241,27 @@ function onInvLink(p, m) {
   if (!p.addr || !rooms.get(p.addr)) return roomFail(p, 'Save your Home first, then you can share a link.');
   const l = invites.link(p.addr, !!m.renew); send(p, { t: 'invlink', token: l.token, exp: l.exp });
 }
-function onRoomPrep(p, m) {
+const needsTier = doc => !!doc && Array.isArray(doc.pieces) && doc.pieces.some(it => it && roomsLib.CAT.pieces[it.p] && roomsLib.CAT.pieces[it.p].minTier);
+const needsShop = doc => !!doc && Array.isArray(doc.pieces) && doc.pieces.some(it => it && roomsLib.CAT.pieces[it.p] && roomsLib.CAT.pieces[it.p].shop);
+const SHOP_DOWN = 'Could not check the shop just now. Try again in a moment.';
+async function homeLim(p, doc) {                      // a Home may hold tier-locked pieces if the wallet's license has the tier, and shop pieces if the wallet owns the item (the shop contract, read by shop.js); each is only read when the document has such a piece
+  const lim = {};
+  if (needsTier(doc) || needsShop(doc)) { try { lim.tier = (await ownLicense(p, false)).tier; } catch (e) { lim.tier = 0; } }
+  if (needsShop(doc)) { try { await shop.owned(p.addr); } catch (e) { throw new Error(SHOP_DOWN); } lim.owns = shop.ownsFn(p.addr, lim.tier || 0); }
+  return lim;
+}
+async function onRoomPrep(p, m) {
   if (!p.addr) return roomFail(p, 'Connect and sign in with your wallet to save your room.');
   const t = now(); if (t - p.lastPrep < CFG.roomPrepMs) return roomFail(p, 'Slow down a little.'); p.lastPrep = t;
-  try { const r = rooms.prepare(m.doc); send(p, { t: 'roomprep', message: r.message, ts: r.ts, n: r.doc.pieces.length }); } catch (e) { roomFail(p, 'That room could not be read.'); }
+  const lim = await homeLim(p, m.doc);
+  try { const r = rooms.prepare(m.doc, lim); send(p, { t: 'roomprep', message: r.message, ts: r.ts, n: r.doc.pieces.length }); } catch (e) { roomFail(p, 'That room could not be read.'); }
 }
-function onRoomSave(p, m) {
+async function onRoomSave(p, m) {
   if (!p.addr) return roomFail(p, 'Connect and sign in with your wallet to save your room.');
   const t = now(); if (t - p.lastSave < CFG.roomSaveMs) return roomFail(p, 'Slow down a little.'); p.lastSave = t;
+  const lim = await homeLim(p, m.doc);
   try {
-    const rec = rooms.save(p.addr, m.doc, m.ts, m.sig);
+    const rec = rooms.save(p.addr, m.doc, m.ts, m.sig, lim);
     send(p, { t: 'roomsaved', at: rec.savedAt, hash: rec.hash });
     bcast('room:' + p.addr, { t: 'roomdoc', doc: rec.doc, savedAt: rec.savedAt }, p);       // visitors standing in the room see the new look
     log('room saved', p.addr, rec.doc.pieces.length + ' pieces');
@@ -238,15 +269,49 @@ function onRoomSave(p, m) {
 }
 
 // ---------- venues: the license, activation, the signed room and facade, open and close (docs/game/world.md)
-const hotelPush = () => { const m = { t: 'hotel', floors: hotel.floors(), venues: hotel.list(), counts: venueCounts() }; for (const q of players.values()) if (q.space.startsWith('hotel:')) send(q, m); };
+const hotelList = () => hotel.list().map(v => { const e = shop.eventFor(v.id); return e ? { ...v, event: e.title, eventMega: !!e.mega, eventUntil: e.until } : v; });      // the directory carries the running event of a venue
+const hotelPush = () => { const m = { t: 'hotel', floors: hotel.floors(), venues: hotelList(), counts: venueCounts() }; for (const q of players.values()) if (q.space.startsWith('hotel:')) send(q, m); };
 async function ownLicense(p, fresh) {
   if (!p.addr) throw new Error('Connect and sign in with your wallet first.');
   try { return await license.get(p.addr, fresh); } catch (e) { throw new Error('Could not check the chain just now. Try again in a moment.'); }
 }
+// holdings against the venue (docs/game/world.md): below its tier the venue is frozen (closed, decor kept); back within 7 days it reopens; after 7 days the slot is freed and the venue kept in an archive
+function afterReconcile(addr, what) {
+  const v = hotel.byOwner(addr); log('venue', what, addr);
+  if (what === 'frozen' || what === 'expired') kickFrom(v ? v.id : 'h' + addr.slice(2, 10), addr, 'The venue was frozen: its owner holds fewer Chogs than it needs.');
+  hotelPush();
+  for (const q of players.values()) if (q.addr === addr) send(q, { t: 'venuemine', mine: hotel.mine(addr), archived: !hotel.byOwner(addr) && hotel.hasArchive(addr), offer: null });
+}
+function kickFrom(id, exceptAddr, text) {             // everybody inside goes back to the hall of the venue's floor (the owner may stay)
+  const v = hotel.get(id), floor = v ? v.floor : 1;
+  for (const q of players.values()) if (q.space.startsWith('venue:') && venueIdOf(q.space) === id && q.addr !== exceptAddr) { bcast(q.space, { t: 'leave', id: q.id }, q); q.space = 'hotel:' + floor; send(q, { t: 'sys', text }); send(q, { t: 'kicked', floor }); }
+}
+async function reconcileOwner(addr, fresh) {          // never freezes on a chain error
+  if (!hotel.byOwner(addr)) return null;
+  let L; try { L = await license.get(addr, fresh); } catch (e) { return null; }
+  const what = hotel.reconcile(addr, L.tier); if (what) afterReconcile(addr, what); return what;
+}
+async function sweepVenues() {                        // every few hours: re-read every owner's holdings (also frees the slots whose 7 days passed)
+  const done = []; for (const addr of hotel.owners()) { const what = await reconcileOwner(addr, true); if (what) done.push([addr, what]); } return done;
+}
 async function onVenueInfo(p) {
   const t = now(); if (t - p.lastVenue < 1000) return; p.lastVenue = t;
+  await shop.owned(p.addr).catch(() => { });                                       // the venue card shows the extras budget
   const L = await ownLicense(p, false);
-  send(p, { t: 'venueinfo', tier: L.tier, points: L.points, tokens: L.tokens.length, templates: hotelLib.TEMPLATES, mine: hotel.mine(p.addr) });
+  const what = hotel.reconcile(p.addr, L.tier); if (what) afterReconcile(p.addr, what);
+  send(p, { t: 'venueinfo', tier: L.tier, points: L.points, tokens: L.tokens.length, templates: hotelLib.TEMPLATES, music: hotelLib.MUSIC, mine: hotel.mine(p.addr), archived: !hotel.byOwner(p.addr) && hotel.hasArchive(p.addr), offer: hotel.offerFor(p.addr, L.tier) });
+}
+async function onVenueMove(p) {                       // upgrade, move to a smaller room, or take the archived venue back into a room of the license's tier
+  const t = now(); if (t - p.lastVenue < 1000) return roomFail(p, 'Slow down a little.'); p.lastVenue = t;
+  const L = await ownLicense(p, true);
+  await shop.owned(p.addr).catch(() => { });                                       // a moved venue keeps the shop pieces the owner has
+  const before = hotel.byOwner(p.addr), oldId = before ? before.id : null;
+  const off = hotel.offerFor(p.addr, L.tier); if (!off) return roomFail(p, L.tier ? 'Your venue already fits your tier.' : 'You need a Chog to open a venue.');
+  const r = hotel.relocate(p.addr, L.tier);
+  log('venue ' + off.kind, p.addr, 'tier', L.tier, '#' + r.venue.no, 'from floor', r.from.floor);
+  if (oldId) kickFrom(oldId, p.addr, 'The venue moved to another room.');
+  for (const q of players.values()) if (q.addr === p.addr && q.space.startsWith('venue:')) { bcast(q.space, { t: 'leave', id: q.id }, q); q.space = 'hotel:' + r.venue.floor; send(q, { t: 'kicked', floor: r.venue.floor }); }
+  send(p, { t: 'venuemine', mine: hotel.mine(p.addr), archived: false, offer: null, moved: off.kind }); hotelPush();
 }
 async function onVenueMake(p, m) {
   const t = now(); if (t - p.lastVenue < 1000) return roomFail(p, 'Slow down a little.'); p.lastVenue = t;
@@ -260,28 +325,102 @@ function onVenueSet(p, m) {
   if (!p.addr || !hotel.byOwner(p.addr)) return roomFail(p, 'You have no venue yet.');
   const t = now(); if (t - p.lastVenue < 400) return roomFail(p, 'Slow down a little.'); p.lastVenue = t;
   const before = JSON.stringify(hotel.list().find(v => v.id === hotel.byOwner(p.addr).id));
-  hotel.update(p.addr, { open: m.open === undefined ? undefined : !!m.open, rule: m.rule, guests: m.guests, bans: m.bans, name: m.name, cat: m.cat, desc: m.desc });
+  const oldMusic = hotel.byOwner(p.addr).music || '';
+  hotel.update(p.addr, { open: m.open === undefined ? undefined : !!m.open, rule: m.rule, guests: m.guests, bans: m.bans, name: m.name, cat: m.cat, desc: m.desc, music: m.music, vipRule: m.vipRule, vipGuests: m.vipGuests });
   const v = hotel.byOwner(p.addr);
   send(p, { t: 'venuemine', mine: hotel.mine(p.addr) });
+  if ((v.music || '') !== oldMusic) for (const lv of [1, 2]) bcast(venueSpace(v.id, lv), { t: 'venuemusic', id: v.id, music: v.music || '' });
   if (JSON.stringify(hotel.list().find(x => x.id === v.id)) !== before) hotelPush();
-  if (v.state !== 'open') for (const q of players.values()) if (q.space === 'venue:' + v.id && q.addr !== p.addr) { q.space = 'hotel:' + v.floor; send(q, { t: 'sys', text: 'The venue was closed by its owner.' }); }
+  if (v.state !== 'open') for (const q of players.values()) if (q.space.startsWith('venue:') && venueIdOf(q.space) === v.id && q.addr !== p.addr) { bcast(q.space, { t: 'leave', id: q.id }, q); q.space = 'hotel:' + v.floor; send(q, { t: 'sys', text: 'The venue was closed by its owner.' }); send(q, { t: 'kicked', floor: v.floor }); }
 }
-const venueStore = kind => (kind === 'facade' ? hotel.facades : hotel.docs), venueLim = (kind, v) => (kind === 'facade' ? hotel.facadeLimits(v) : hotel.limitsOf(v));
-function onVenuePrep(p, m, kind) {
-  const v = p.addr && hotel.byOwner(p.addr); if (!v) return roomFail(p, 'You have no venue yet.');
+const levelOf = (v, m) => (+m.level === 2 && (v.levels || 1) > 1 ? 2 : 1);
+const venueStore = (kind, v, m) => (kind === 'facade' ? hotel.facades : hotel.store(v, levelOf(v, m))), venueLim = (kind, v) => (kind === 'facade' ? hotel.facadeLimits(v) : hotel.limitsOf(v));
+const FROZEN_MSG = 'Your venue is frozen until you hold enough Chogs again.';
+async function onVenuePrep(p, m, kind) {
+  const v = p.addr && hotel.byOwner(p.addr); if (!v) return roomFail(p, 'You have no venue yet.'); if (v.state === 'frozen') return roomFail(p, FROZEN_MSG);
   const t = now(); if (t - p.lastPrep < CFG.roomPrepMs) return roomFail(p, 'Slow down a little.'); p.lastPrep = t;
-  try { const r = venueStore(kind).prepare(m.doc, venueLim(kind, v)); send(p, { t: kind + 'prep', message: r.message, ts: r.ts, n: r.doc.pieces.length }); } catch (e) { roomFail(p, 'That could not be read.'); }
+  try { await shop.owned(p.addr); } catch (e) { return roomFail(p, SHOP_DOWN); }
+  try { const r = venueStore(kind, v, m).prepare(m.doc, venueLim(kind, v)); send(p, { t: kind + 'prep', message: r.message, ts: r.ts, n: r.doc.pieces.length }); } catch (e) { roomFail(p, 'That could not be read.'); }
 }
-function onVenueSave(p, m, kind) {
-  const v = p.addr && hotel.byOwner(p.addr); if (!v) return roomFail(p, 'You have no venue yet.');
+async function onVenueSave(p, m, kind) {
+  const v = p.addr && hotel.byOwner(p.addr); if (!v) return roomFail(p, 'You have no venue yet.'); if (v.state === 'frozen') return roomFail(p, FROZEN_MSG);
   const t = now(); if (t - p.lastSave < CFG.roomSaveMs) return roomFail(p, 'Slow down a little.'); p.lastSave = t;
+  try { await shop.owned(p.addr); } catch (e) { return roomFail(p, SHOP_DOWN); }
   try {
-    const rec = venueStore(kind).save(p.addr, m.doc, m.ts, m.sig, venueLim(kind, v));
-    send(p, { t: kind + 'saved', at: rec.savedAt, hash: rec.hash, mine: hotel.mine(p.addr) });
-    if (kind === 'venue') bcast('venue:' + v.id, { t: 'roomdoc', doc: rec.doc, savedAt: rec.savedAt }, p);
+    const rec = venueStore(kind, v, m).save(p.addr, m.doc, m.ts, m.sig, venueLim(kind, v)), level = levelOf(v, m);
+    send(p, { t: kind + 'saved', at: rec.savedAt, hash: rec.hash, level, mine: hotel.mine(p.addr) });
+    if (kind === 'venue') bcast(venueSpace(v.id, level), { t: 'roomdoc', doc: rec.doc, savedAt: rec.savedAt }, p);
     else for (const q of players.values()) if (q.space === 'hotel:' + v.floor) send(q, { t: 'facades', floor: v.floor, items: hotel.facadesOn(v.floor) });
     log(kind + ' saved', p.addr, rec.doc.pieces.length + ' pieces');
   } catch (e) { roomFail(p, e.message); }
+}
+
+// ---------- shop: what a wallet owns (shop.js), worn cosmetics, events, the security camera, tips
+const evPush = () => { const m = { t: 'events', list: shop.activeEvents() }; for (const q of players.values()) send(q, m); };
+async function shopTier(p, owned) {                     // the license tier, read only when something owned is tier-locked
+  if (!Object.keys(owned).some(id => (shop.byId.get(+id) || {}).minTier)) return 0;
+  try { return (await ownLicense(p, false)).tier; } catch (e) { return 0; }
+}
+const NO_SHOP = { owned: {}, equip: {}, events: { event: 0, mega: 0 }, camera: false, budget: { pieces: 0, lights: 0 } };
+async function shopSync(p, fresh) {                     // read the wallet's items, refresh what it wears, tell it (and its venue card)
+  if (!p.addr) return;
+  const owned = await shop.owned(p.addr, fresh), tier = await shopTier(p, owned); p.shopTier = tier;
+  const cos = shop.worn(p.addr, tier), same = JSON.stringify(cos) === JSON.stringify(p.cosm || {});
+  if (!same) { p.cosm = Object.keys(cos).length ? cos : null; bcast(p.space, { t: 'appear', p: pub(p) }); }
+  send(p, { t: 'shopstate', ...shop.snapshot(p.addr, tier) });
+  if (hotel.byOwner(p.addr)) send(p, { t: 'venuemine', mine: hotel.mine(p.addr) });
+}
+async function onShop(p, m) {
+  if (m.t === 'shopget') {
+    if (!p.addr) return send(p, { t: 'shopstate', ...shop.info(), ...NO_SHOP });
+    const t0 = now(); if (t0 - p.lastShop < 800) return; p.lastShop = t0;
+    try { return await shopSync(p, false); } catch (e) { return roomFail(p, SHOP_DOWN); }
+  }
+  if (!p.addr) return roomFail(p, 'Connect and sign in with your wallet first.');
+  const t = now(); if (t - p.lastShop < 300) return roomFail(p, 'Slow down a little.'); p.lastShop = t;
+  try {
+    if (m.t === 'shopnotice') {                                              // the client saw a purchase confirm: read the balances again (a second time a moment later, in case the node lags)
+      if (t - (p.lastNotice || 0) < 2000) return; p.lastNotice = t; shop.invalidate(p.addr); await shopSync(p, true);
+      setTimeout(() => { if (players.get(p.id) === p) shopSync(p, true).catch(() => { }); }, 2500).unref(); return;
+    }
+    if (m.t === 'shopbuy') { shop.mockBuy(p.addr, m.id, m.qty); return await shopSync(p, true); }       // refused unless the server runs with SHOP_MOCK=1
+    if (m.t === 'equip') {
+      await shop.owned(p.addr); const it = shop.byId.get(+m.id), tier = it && it.minTier ? await shopTier(p, { [it.id]: 1 }) : 0;
+      shop.equip(p.addr, String(m.slot), m.id == null ? null : +m.id, tier); return await shopSync(p, false);
+    }
+    if (m.t === 'eventstart') {
+      const v = hotel.byOwner(p.addr); await shop.owned(p.addr);
+      const e = shop.startEvent(p.addr, v, m.title, !!m.mega, v ? v.tier : 0);
+      log('event', e.name, e.title); evPush(); hotelPush(); sys(p, `Event announced for 24 hours: ${e.title}`); return await shopSync(p, false);
+    }
+    if (m.t === 'camopen') {
+      const v = hotel.byOwner(p.addr); if (!v) return roomFail(p, 'You have no venue yet.');
+      await shop.owned(p.addr); if (!shop.cameraAllowed(p.addr, v.tier)) return roomFail(p, 'You need the security camera from the shop.');
+      p.cam = v.id; return send(p, cameraInit(v));
+    }
+    if (m.t === 'camclose') { p.cam = null; return; }
+    if (m.t === 'tip') return await onTip(p, m);
+  } catch (e) { roomFail(p, e && e.message ? e.message : 'That did not work.'); }
+}
+function cameraInit(v) {                                  // the room as flat boxes (footprints from the catalog): the camera window draws these and the people on top, live
+  const flat = doc => ((doc && doc.pieces) || []).map(it => { const d = roomsLib.CAT.pieces[it.p]; return d ? { p: it.p, x: it.x, z: it.z, ry: it.ry || 0, w: d.fp[0], d: d.fp[1], cat: d.cat } : null; }).filter(Boolean);
+  const full = hotel.get(v.id);
+  return { t: 'camera', init: 1, id: v.id, name: v.name, size: hotel.sizeOf(v), levels: v.levels || 1, pieces: flat(full && full.doc), pieces2: flat(full && full.doc2) };
+}
+function cameraFrame(v) {
+  const list = []; for (const q of players.values()) if (q.space.startsWith('venue:') && venueIdOf(q.space) === v.id) list.push({ id: q.id, name: q.name, x: r2(q.x), z: r2(q.z), l: q.space.endsWith('#2') ? 2 : 1, mv: q.mv ? 1 : 0, owner: q.addr === v.addr ? 1 : 0 });
+  return { t: 'camera', players: list, at: now() };
+}
+async function onTip(p, m) {
+  const v = hotel.get(String(m.venueId)); if (!v || !v.addr) throw new Error('Only holder venues can be tipped.');
+  if (v.addr === p.addr) throw new Error('You cannot tip yourself.');
+  if (!p.space.startsWith('venue:') || venueIdOf(p.space) !== v.id) throw new Error('You tip from inside the venue.');
+  const whole = Math.floor(+m.amount); if (!(whole >= 1 && whole <= 10000000)) throw new Error('That is not a valid tip.');
+  const wei = await shop.verifyTip(m.tx, { from: p.addr, to: v.addr, venueId: v.no, amount: BigInt(whole) * 10n ** 18n });
+  const amount = Number(BigInt(wei) / 10n ** 18n);
+  const msg = { t: 'tipped', name: p.name, amount, venue: v.id }; for (const lv of [1, 2]) bcast(venueSpace(v.id, lv), msg);
+  for (const q of players.values()) if (q.addr === v.addr && !q.space.startsWith('venue:' + v.id)) send(q, msg);
+  log('tip', p.name, '->', v.name, amount);
 }
 
 // ---------- usernames
@@ -317,12 +456,13 @@ wss.on('connection', (ws, req) => {
 
   const id = nextId++, nonce = crypto.randomBytes(12).toString('hex');
   const p = {
-    id, ws, ip, nonce, addr: null, token: null, space: 'city', lastEnter: 0, lastPrep: 0, lastSave: 0, lastInvite: 0, lastVenue: 0, username: null, invitedTo: new Map(), guest: 'Guest-' + String(1000 + (id * 7919) % 9000), name: '',
+    id, ws, ip, nonce, addr: null, token: null, space: 'city', lastEnter: 0, lastPrep: 0, lastSave: 0, lastInvite: 0, lastVenue: 0, lastShop: 0, cosm: null, cam: null, username: null, invitedTo: new Map(), guest: 'Guest-' + String(1000 + (id * 7919) % 9000), name: '',
     x: 0.5 + (Math.random() - 0.5) * 0.8, z: 2.0 + (Math.random() - 0.5) * 0.8, ry: 0.6, mv: false, dirty: false, moveAt: now(), strikes: 0,
     chatTimes: [], lastText: '', lastAt: 0, mutedUntil: 0, reports: [], lastReport: 0, alive: true, authBusy: false,
   };
   p.name = p.guest; players.set(id, p); stats.connected++;
-  send(p, { t: 'welcome', id, name: p.name, challenge: challengeText(nonce), players: [...players.values()].filter(q => q !== p && q.space === 'city').map(pub), you: pub(p), maxChat: CFG.chatMax, rooms: 1, hotel: 1 });
+  send(p, { t: 'welcome', id, name: p.name, challenge: challengeText(nonce), players: [...players.values()].filter(q => q !== p && q.space === 'city').map(pub), you: pub(p), maxChat: CFG.chatMax, rooms: 1, hotel: 1, shop: shop.info() });
+  send(p, { t: 'events', list: shop.activeEvents() });
   bcast('city', { t: 'join', p: pub(p) }, p);
   log('join', p.name, `(${players.size} online)`);
 
@@ -333,25 +473,30 @@ wss.on('connection', (ws, req) => {
     if (data.length > 2048 && !['roomprep', 'roomsave', 'venueprep', 'venuesave', 'facadeprep', 'facadesave'].includes(m.t)) return;
     try {
       if (m.t === 'move') return onMove(p, m);
+      if (m.t.startsWith('g_') && games.onMessage(p, m)) return;
+      if (m.t.startsWith('ex_') && exhibition.onMessage(p, m, send)) return;
       if (m.t === 'chat') return onChat(p, m.text);
       if (m.t === 'report') return onReport(p, m);
-      if (m.t === 'enter') return onEnter(p, m);
-      if (m.t === 'hotelinfo') return send(p, { t: 'hotel', floors: hotel.floors(), venues: hotel.list(), counts: venueCounts() });
+      if (m.t === 'enter') { if (m.space === 'venue') { const ve = hotel.get(String(m.id)); if (ve && ve.addr) await shop.owned(ve.addr).catch(() => { }); }          // the venue's budget extras and shop pieces come from its owner's items
+        if (m.space === 'venue' && p.addr) { const v = hotel.byOwner(p.addr); if (v && v.id === String(m.id)) await reconcileOwner(p.addr, false); } return onEnter(p, m); }          // the owner walking in: their holdings are checked first
+      if (m.t === 'hotelinfo') return send(p, { t: 'hotel', floors: hotel.floors(), venues: hotelList(), counts: venueCounts() });
       if (m.t === 'hotelfloor') { const f = Math.floor(+m.floor); return send(p, { t: 'facades', floor: f, items: hotel.facadesOn(f) }); }
       if (m.t === 'usernameprep') return onUsernamePrep(p, m);
       if (m.t === 'usernamesave') return onUsernameSave(p, m);
       if (m.t === 'venueinfo') return await onVenueInfo(p);
       if (m.t === 'venuemake') return await onVenueMake(p, m);
       if (m.t === 'venueset') return onVenueSet(p, m);
-      if (m.t === 'venueprep') return onVenuePrep(p, m, 'venue');
-      if (m.t === 'venuesave') return onVenueSave(p, m, 'venue');
-      if (m.t === 'facadeprep') return onVenuePrep(p, m, 'facade');
-      if (m.t === 'facadesave') return onVenueSave(p, m, 'facade');
+      if (m.t === 'venuemove') return await onVenueMove(p);
+      if (m.t === 'venueprep') return await onVenuePrep(p, m, 'venue');
+      if (m.t === 'venuesave') return await onVenueSave(p, m, 'venue');
+      if (m.t === 'facadeprep') return await onVenuePrep(p, m, 'facade');
+      if (m.t === 'facadesave') return await onVenueSave(p, m, 'facade');
+      if (m.t === 'shopget' || m.t === 'shopnotice' || m.t === 'shopbuy' || m.t === 'equip' || m.t === 'eventstart' || m.t === 'camopen' || m.t === 'camclose' || m.t === 'tip') return await onShop(p, m);
       if (m.t === 'invite') return onInvite(p, m);
       if (m.t === 'invlink') return onInvLink(p, m);
-      if (m.t === 'roomprep') return onRoomPrep(p, m);
-      if (m.t === 'roomsave') return onRoomSave(p, m);
-      if (m.t === 'logout') { p.addr = null; p.username = null; return setLook(p, null); }
+      if (m.t === 'roomprep') return await onRoomPrep(p, m);
+      if (m.t === 'roomsave') return await onRoomSave(p, m);
+      if (m.t === 'logout') { p.addr = null; p.username = null; p.cosm = null; p.cam = null; return setLook(p, null); }
       if (m.t === 'auth') {
         if (p.authBusy) return; p.authBusy = true;
         try {
@@ -363,6 +508,8 @@ wss.on('connection', (ws, req) => {
           let session = typeof m.session === 'string' && sessions.has(m.session) ? m.session : null;
           if (!session) { session = crypto.randomBytes(24).toString('hex'); sessions.set(session, { addr, exp: now() + CFG.sessionMs }); }
           send(p, { t: 'authed', addr, session, username: p.username });
+          reconcileOwner(addr, false).catch(() => { });                              // signing in: the holdings are checked against the venue
+          shopSync(p, false).catch(() => { send(p, { t: 'shopstate', ...shop.info(), ...NO_SHOP, down: true }); });          // signing in: what the wallet owns in the shop, and what it wears
         } catch (e) { send(p, { t: 'authfail', reason: 'bad proof' }); } finally { p.authBusy = false; }
         return;
       }
@@ -374,10 +521,10 @@ wss.on('connection', (ws, req) => {
         if (owner !== p.addr) return send(p, { t: 'sys', text: `Chog #${token} is not in your wallet.` });
         return setLook(p, token);
       }
-    } catch (e) { log('handler error', e.message); if (/^(You |Connect |Decorate |Could not check)/.test(e.message)) roomFail(p, e.message); }
+    } catch (e) { log('handler error', e.message); if (/^(You |Your |Connect |Decorate |Could not check|That track)/.test(e.message)) roomFail(p, e.message); }
   });
   ws.on('close', () => {
-    players.delete(id); if (p.token && byToken.get(p.token) === p) byToken.delete(p.token);
+    games.leave(p);     players.delete(id); if (p.token && byToken.get(p.token) === p) byToken.delete(p.token);
     const n = (ipCount.get(ip) || 1) - 1; if (n > 0) ipCount.set(ip, n); else ipCount.delete(ip);
     bcast(p.space, { t: 'leave', id }); log('leave', p.name, `(${players.size} online)`);
   });
@@ -394,10 +541,14 @@ setInterval(() => {                                    // who is inside which ho
   const c = venueCounts(), j = JSON.stringify(c); if (j === lastCounts) return; lastCounts = j;
   for (const p of players.values()) if (p.space.startsWith('hotel:')) send(p, { t: 'counts', c });
 }, 2000);
+setInterval(() => { if (shop.sweepEvents()) { evPush(); hotelPush(); } }, 20000).unref();     // an event that ended leaves the banner and the directory
+setInterval(() => { for (const p of players.values()) if (p.cam) { const v = hotel.byOwner(p.addr); if (!v || v.id !== p.cam) { p.cam = null; continue; } send(p, cameraFrame(v)); } }, 1000).unref();      // security camera: who is where in the venue, once a second
+const SWEEP_MS = +process.env.VENUE_SWEEP_MS || 6 * 3600e3;
+setInterval(() => { sweepVenues().catch(e => log('venue sweep failed', e.message)); }, SWEEP_MS).unref();     // every 6 hours
 setInterval(() => {                                    // drop dead sockets, expire sessions
   for (const p of players.values()) { if (!p.alive) { p.ws.terminate(); continue; } p.alive = false; try { p.ws.ping(); } catch (e) { /* closing */ } }
   const t = now(); for (const [k, s] of sessions) if (s.exp < t) sessions.delete(k);
 }, CFG.pingMs);
 
-if (require.main === module) server.listen(CFG.port, () => log(`Chog Town server on :${CFG.port}  (rpc ${CFG.rpc})`));
-module.exports = { server, wss, CFG, challengeText };
+if (require.main === module) server.listen(CFG.port, () => log(`Chog Hotel server on :${CFG.port}  (rpc ${CFG.rpc})`));
+module.exports = { server, wss, CFG, challengeText, clock, hotel, sweepVenues, shop };

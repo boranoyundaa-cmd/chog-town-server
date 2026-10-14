@@ -9,7 +9,7 @@ const NAME = /^[A-Za-z][A-Za-z0-9_]{2,15}$/;
 const RESERVED = /^(admin|administrator|mod|moderator|staff|guard|guide|reception|chog|chogs|chogtown|system|support|owner|npc|official|monad|resident|barista)$/i;
 const LOOKS_AUTO = /^(guest|chog)_?\d*$/i;                       // would pass for the automatic names ("Guest-1234", "Chog #1700")
 const COOLDOWN_MS = 7 * 24 * 3600e3, MAX_AGE_MS = 2 * 60e3;
-const messageFor = (name, ts) => `Chog Town username\nClaim the name "${name}" for this wallet.\nIt is free and sends no transaction.\nTime: ${ts}`;
+const messageFor = (name, ts) => `Chog Hotel username\nClaim the name "${name}" for this wallet.\nIt is free and sends no transaction.\nTime: ${ts}`;
 
 function open(dataDir) {
   const file = path.join(dataDir, 'users.json');

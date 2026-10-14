@@ -2,11 +2,11 @@
   "name": "chog-town-server",
   "version": "0.1.0",
   "private": true,
-  "description": "Realtime presence and chat for Chog Town. Ownership and money stay on-chain; this only carries who is where and what they say.",
+  "description": "Realtime presence and chat for Chog Hotel. Ownership and money stay on-chain; this only carries who is where and what they say.",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "test": "node test/smoke.js && node test/venues.js"
+    "test": "node test/smoke.js && node test/venues.js && node test/migrate.js && node test/games.js && node test/exhibition.js && node test/shop.js"
   },
   "engines": {
     "node": ">=20"

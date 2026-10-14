@@ -11,13 +11,14 @@ const { verifyMessage } = require('ethers');
 const { clean } = require('./filter');
 const CAT = require('./room_catalog.json');
 
-const LIMITS = { pieces: 40, name: 32, text: 24, size: [9, 7], maxAgeMs: 2 * 60e3 };      // free room: 40 pieces on a 9 x 7 floor
+const LIMITS = { pieces: 80, name: 32, text: 24, size: [13, 10], lights: 10, maxAgeMs: 2 * 60e3 };      // free Home: 80 pieces on a 13 x 10 floor (130 m2); a venue gets its tier's room from hotel.js
 const HEX = /^#[0-9a-f]{6}$/i;
 const num = (v, a, b) => Math.max(a, Math.min(b, Math.round((+v || 0) * 100) / 100));
 const text = (raw, max) => clean(String(raw == null ? '' : raw).slice(0, 120)).text.replace(/\[(link|address) removed\]/g, '').trim().slice(0, max);
 
 // the cleaned document: fixed key order, so the same room always hashes the same
-function sanitize(doc, limit = LIMITS.pieces, size = LIMITS.size, fallbackName = 'My Home') {
+// opts: { tier, venue, owns }: a piece with `minTier` needs that tier; a piece marked `venue` (stage, DJ booth, game tables) only goes into a hotel venue; a piece with `shop` (an item id) needs owns(id) to say yes
+function sanitize(doc, limit = LIMITS.pieces, size = LIMITS.size, fallbackName = 'My Home', opts = {}) {
   if (!doc || typeof doc !== 'object') throw new Error('no room');
   const [W, D] = size, out = {};
   out.name = text(doc.name, LIMITS.name) || fallbackName;
@@ -32,8 +33,12 @@ function sanitize(doc, limit = LIMITS.pieces, size = LIMITS.size, fallbackName =
   out.pieces = [];
   for (const it of (Array.isArray(doc.pieces) ? doc.pieces : []).slice(0, limit)) {
     const def = it && CAT.pieces[it.p]; if (!def) continue;
+    if ((def.minTier || 0) > (opts.tier || 0) || (def.venue && !opts.venue)) continue;                      // tier-locked pieces and venue-only pieces are dropped, whatever the client sent
+    if (def.shop && !(opts.owns && opts.owns(def.shop))) continue;                                           // a shop piece stays only if the wallet owns the item (and its tier lock is met): the shop's soulbound NFT, read from the chain                      // tier-locked pieces and venue-only pieces are dropped, whatever the client sent
     const o = { p: it.p, x: num(it.x, -W / 2, W / 2), z: num(it.z, -D / 2, D / 2) };
-    const ry = ((Math.round((+it.ry || 0) / 90) * 90) % 360 + 360) % 360; if (ry) o.ry = ry;
+    let ry = ((Math.round((+it.ry || 0) / 90) * 90) % 360 + 360) % 360;
+    if (def.wall) { ry = ry % 180 ? 90 : 0; if (ry) o.x = -W / 2; else o.z = -D / 2; }               // a wall piece always hangs ON a back wall, facing the room (a room that changed size cannot leave one floating)
+    if (ry) o.ry = ry;
     if (typeof it.c === 'string' && HEX.test(it.c)) o.c = it.c.toLowerCase();
     if (def.edit) { const t = text(it.txt, LIMITS.text); if (t) o.txt = t; }
     out.pieces.push(o);
@@ -43,7 +48,7 @@ function sanitize(doc, limit = LIMITS.pieces, size = LIMITS.size, fallbackName =
 
 const hashOf = doc => crypto.createHash('sha256').update(JSON.stringify(doc)).digest('hex');
 // what the wallet shows when asked to sign: readable, tied to the exact document, valid for two minutes
-const messageFor = (doc, ts, kind = 'room') => `Chog Town ${kind}\nSave "${doc.name}" (${doc.pieces.length} pieces).\nThis costs nothing and sends no transaction.\nHash: ${hashOf(doc)}\nTime: ${ts}`;
+const messageFor = (doc, ts, kind = 'room') => `Chog Hotel ${kind}\nSave "${doc.name}" (${doc.pieces.length} pieces).\nThis costs nothing and sends no transaction.\nHash: ${hashOf(doc)}\nTime: ${ts}`;
 
 // ---- storage: one file per wallet (DATA_DIR/<sub>/<address>.json), a small cache in memory per store
 // kind = 'room' | 'venue' | 'facade' (what the wallet is told it signs); lim = { limit, size, name } overrides the free-room budget
@@ -51,7 +56,7 @@ function open(dataDir, sub = 'rooms', kind = 'room') {
   const dir = path.join(dataDir, sub); fs.mkdirSync(dir, { recursive: true });
   const cache = new Map(), file = addr => path.join(dir, addr + '.json');
   const ok = addr => /^0x[0-9a-f]{40}$/.test(addr);
-  const clean_ = (raw, lim = {}) => { const d = sanitize(raw, lim.limit ?? LIMITS.pieces, lim.size ?? LIMITS.size, lim.name ?? 'My Home'); return lim.post ? lim.post(d) : d; };       // post: a last rule on the cleaned document (the facade keeps its door clear)
+  const clean_ = (raw, lim = {}) => { const d = sanitize(raw, lim.limit ?? LIMITS.pieces, lim.size ?? LIMITS.size, lim.name ?? 'My Home', { tier: lim.tier, venue: lim.venue, owns: lim.owns }); return lim.post ? lim.post(d) : d; };       // post: a last rule on the cleaned document (the facade keeps its door clear)
   return {
     get(addr) {
       if (!ok(addr)) return null;
@@ -73,6 +78,15 @@ function open(dataDir, sub = 'rooms', kind = 'room') {
       const tmp = file(addr) + '.tmp'; fs.writeFileSync(tmp, JSON.stringify(rec)); fs.renameSync(tmp, file(addr));
       cache.set(addr, rec); return rec;
     },
+    // put: the server itself stores a document it refitted (a venue moved to another room size). Not signed by the wallet: `sig` is null and `refit` marks it.
+    put(addr, raw, lim, now = Date.now()) {
+      if (!ok(addr)) throw new Error('no wallet');
+      const doc = clean_(raw, lim), rec = { addr, doc, hash: hashOf(doc), sig: null, refit: true, ts: now, savedAt: now };
+      const tmp = file(addr) + '.tmp'; fs.writeFileSync(tmp, JSON.stringify(rec)); fs.renameSync(tmp, file(addr));
+      cache.set(addr, rec); return rec;
+    },
+    // drop: forget a document (the caller keeps a copy)
+    drop(addr) { if (!ok(addr)) return; cache.delete(addr); try { fs.unlinkSync(file(addr)); } catch (e) { /* none */ } },
   };
 }
 

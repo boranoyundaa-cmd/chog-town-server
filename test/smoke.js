@@ -100,7 +100,7 @@ let n = 0; const ok = name => console.log(`  ok ${++n} ${name}`);
   R1.send({ t: 'move', x: 40, z: 40, ry: 0, mv: true }); await sleep(200); R1.send({ t: 'move', x: 40, z: 40, ry: 0, mv: true }); await sleep(150);
 
   const doc = { name: 'Neon <b>lounge</b> https://evil.xyz', theme: 'cyberpunk', view: 'neon', ambience: 'night', wall: { c: '#112233', pat: 'brick' }, floor: { c: 'red', pat: 'nope' }, windows: false, custom: { x: { parts: [] } },
-    pieces: [{ p: 'sofa', x: 0.123, z: 1.5, ry: 180 }, { p: 'wallText', x: -4.5, z: 0, ry: 90, txt: 'HELLO https://bad.io 0x' + 'a'.repeat(40) + ' world', c: '#ff00ff' }, { p: 'doesNotExist', x: 0, z: 0 }, { p: 'nftFrame', x: 0, z: -3.5, img: 'http://x/y.png' }, { p: 'bed', x: 99, z: -99, ry: 45, k: 3, y: 2 }] };
+    pieces: [{ p: 'sofa', x: 0.123, z: 1.5, ry: 180 }, { p: 'wallText', x: -4.5, z: 0.5, ry: 90, txt: 'HELLO https://bad.io 0x' + 'a'.repeat(40) + ' world', c: '#ff00ff' }, { p: 'doesNotExist', x: 0, z: 0 }, { p: 'nftFrame', x: 0, z: -3.5, img: 'http://x/y.png' }, { p: 'bed', x: 99, z: -99, ry: 45, k: 3, y: 2 }] };
   R1.send({ t: 'roomprep', doc }); const prep = await R1.wait(m => m.t === 'roomprep'); assert(prep.message.includes('Hash:') && prep.n === 3); ok('roomprep returns the cleaned room (3 valid pieces) and a message to sign');
   await sleep(150);
   const sig = await ow.signMessage(prep.message);
@@ -117,7 +117,8 @@ let n = 0; const ok = name => console.log(`  ok ${++n} ${name}`);
   await sleep(800); F1.send({ t: 'enter', space: 'room', who: inv1.owner, ...spawn }); const e2 = await F1.wait(m => m.t === 'entered' && m.space === 'room'); assert(!e2.mine); assert.equal(e2.owner, ow.address.toLowerCase());
   assert(e2.players.some(q => q.id === R1.id)); ok('an invited friend can enter the Home and sees the owner there');
   const d = e2.doc; assert.equal(d.theme, 'cyberpunk'); assert.equal(d.view, 'neon'); assert(!('ambience' in d)); assert.equal(d.windows, false); assert.deepEqual(d.wall, { c: '#112233', pat: 'brick' }); assert(!d.floor); assert(!('custom' in d)); ok('the stored room keeps the valid settings and drops everything else');
-  assert.equal(d.pieces.length, 3); assert(d.pieces.every(q => !('img' in q) && !('k' in q) && !('y' in q))); const bed = d.pieces.find(q => q.p === 'bed'); assert.deepEqual(bed, { p: 'bed', x: 4.5, z: -3.5, ry: 90 }); ok('unknown pieces, images, scale and height are stripped; positions are clamped to the floor');
+  assert.equal(d.pieces.length, 3); assert(d.pieces.every(q => !('img' in q) && !('k' in q) && !('y' in q))); const bed = d.pieces.find(q => q.p === 'bed'); assert.deepEqual(bed, { p: 'bed', x: 6.5, z: -5, ry: 90 }); ok('unknown pieces, images, scale and height are stripped; positions are clamped to the 13 x 10 floor');
+  const wt0 = d.pieces.find(q => q.p === 'wallText'); assert.equal(wt0.x, -6.5); assert.equal(wt0.ry, 90); ok('a wall piece is put on its wall (x = -6.5), so a room that changed size leaves nothing floating');
   const wt2 = d.pieces.find(q => q.p === 'wallText'); assert(!/bad\.io|0xaaaa/.test(wt2.txt) && /HELLO/.test(wt2.txt) && wt2.c === '#ff00ff'); assert(!/evil|https/.test(d.name)); ok('links and wallet addresses are removed from room text');
   const sawF = await R1.wait(m => m.t === 'join' && m.p.id === F1.id); ok('the owner sees the visitor arrive');
   F1.send({ t: 'chat', text: 'nice place' }); await R1.wait(m => m.t === 'chat' && m.text === 'nice place'); ok('visitors and the owner chat inside the room');
@@ -147,7 +148,7 @@ let n = 0; const ok = name => console.log(`  ok ${++n} ${name}`);
   const cn = await F1.wait(m => m.t === 'counts' && m.c.v101 === 1); assert(cn); ok('players in the hotel are told how many people are inside each venue');
   await sleep(450); R1.got.length = 0; R1.send({ t: 'enter', space: 'venue', id: 'nope' }); const nv = await R1.wait(m => m.t === 'roomfail'); assert(/does not exist/.test(nv.reason)); ok('an unknown venue is refused');
   R1.send({ t: 'chat', text: 'venue talk' }); await sleep(200); assert(!F1.got.some(m => m.t === 'chat' && m.text === 'venue talk')); ok('venue chat stays inside the venue');
-  const lastF = F1.got.filter(m => m.t === 'state').pop(); assert(!lastF || lastF.p.every(r => Math.abs(r[1]) <= 7.41 && Math.abs(r[2]) <= 7.41)); ok('walking limits apply on a hotel floor');
+  const lastF = F1.got.filter(m => m.t === 'state').pop(); assert(!lastF || lastF.p.every(r => Math.abs(r[1]) <= 7.81 && Math.abs(r[2]) <= 7.81)); ok('walking limits apply on a hotel floor');
   const big = client(); await big.open; await big.wait(m => m.t === 'welcome'); big.send({ t: 'chat', text: 'x'.repeat(5000) }); await sleep(150); assert(big.ws.readyState === 1); ok('oversized chat frames are ignored');
 
   require('fs').rmSync(process.env.DATA_DIR, { recursive: true, force: true });
