@@ -28,7 +28,7 @@
 //   invlink {renew?} -> invlink {token, exp}     your Home's share link token (renew = revoke the old link)
 //   roomprep {doc} -> roomprep {message, ts}     the cleaned room and the text the wallet must sign
 //   roomsave {doc, ts, sig}                      store the room if the wallet signed exactly that text
-// Server -> client: welcome, authed, authfail, appear (full player), join, leave, state, snap, chat, sys, entered, roomprep, roomsaved, roomfail, roomdoc, invited, invlink, hotel, counts.
+// Server -> client: welcome, authed, authfail, appear (full player), join, leave, state, snap, chat, sys, entered, roomprep, roomsaved, roomfail, roomdoc, enterwait {after}, invited {owner, from, fromId}, invlink, hotel, counts.
 const http = require('http');
 const crypto = require('crypto');
 const fs = require('fs');
@@ -193,7 +193,7 @@ function onMove(p, m) {
 const roomFail = (p, reason) => send(p, { t: 'roomfail', reason });
 const invited = (p, owner, token) => (p.invitedTo.get(owner) || 0) > now() || invites.check(token, owner, now());
 function onEnter(p, m) {
-  const t = now(); if (t - p.lastEnter < 400) return; p.lastEnter = t;
+  const t = now(); if (t - p.lastEnter < 400) return send(p, { t: 'enterwait', after: 400 - (t - p.lastEnter) }); p.lastEnter = t;       // throttled: tell the client when to retry
   let target, owner = null, rec = null, venue = null, level = 1, exhibit = null;
   if (m.space === 'city') target = 'city';
   else if (m.space === 'solo') target = 'solo:' + p.id;
@@ -234,7 +234,7 @@ function onInvite(p, m) {
   for (const [k, e] of q.invitedTo) if (e <= t) q.invitedTo.delete(k);
   if (q.invitedTo.size >= 20 && !q.invitedTo.has(p.addr)) return sys(p, 'That player has too many invitations right now.');
   q.invitedTo.set(p.addr, t + invitesLib.DIRECT_MS);
-  send(q, { t: 'invited', owner: p.addr, from: p.name, token: p.token, exp: t + invitesLib.DIRECT_MS });
+  send(q, { t: 'invited', owner: p.addr, from: p.name, fromId: p.id, token: p.token, exp: t + invitesLib.DIRECT_MS });
   sys(p, `Invitation sent to ${q.name}.`);
 }
 function onInvLink(p, m) {
