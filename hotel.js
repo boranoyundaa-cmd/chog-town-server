@@ -14,14 +14,15 @@ const seeds = require('./seed_venues.json');
 // What a tier gives (placeholders, docs/game/design.md): room floor (W x D metres, every level), piece budget per level, lights, door slots, levels and the facade piece budget
 // cap = people inside at once (both levels together; the owner always gets in), vip = a VIP lounge with its own entry rule (the upper level), stage / music = stage and DJ booth pieces and the venue music (pieces: minTier in the catalog)
 const TEMPLATES = {
-  1: { size: [15, 11], pieces: 120, lights: 12, span: 1, levels: 1, facade: 20, cap: 12, vip: false, music: false },
-  2: { size: [18, 13], pieces: 180, lights: 14, span: 2, levels: 1, facade: 40, cap: 20, vip: false, music: true },
-  3: { size: [18, 13], pieces: 160, lights: 14, span: 2, levels: 2, facade: 60, cap: 32, vip: true, music: true },
-  4: { size: [22, 15], pieces: 200, lights: 16, span: 4, levels: 2, facade: 80, cap: 50, vip: true, music: true },
+  1: { size: [22, 16], pieces: 200, lights: 16, span: 1, levels: 1, facade: 20, cap: 12, vip: false, music: false },
+  2: { size: [27, 20], pieces: 300, lights: 18, span: 2, levels: 1, facade: 40, cap: 20, vip: false, music: true },
+  3: { size: [27, 20], pieces: 280, lights: 18, span: 2, levels: 2, facade: 60, cap: 32, vip: true, music: true },
+  4: { size: [33, 22], pieces: 340, lights: 22, span: 4, levels: 2, facade: 80, cap: 50, vip: true, music: true },
 };
+const OLD_SIZES = { 1: [15, 11], 2: [18, 13], 3: [18, 13], 4: [22, 15] };      // the rooms before the 2026-10-15 enlargement: venues still at these sizes are shifted into the new ones on load
 const SEED_CAP = 30, FREEZE_MS = 7 * 24 * 3600e3;                      // the game's own venues hold 30; a venue whose owner fell below its tier waits 7 days frozen before its slot is freed
 const MUSIC = ['lobby', 'cafe', 'arcade', 'club', 'gallery', 'home'];  // the synthesized tracks (js/audio.js places)
-const SLOT_M = 6.5, FACADE_DEPTH = 1.6, LAYOUT = 2;           // metres of wall per slot, how far a facade may reach into the hall, the numbering scheme of the records
+const SLOT_M = 10, FACADE_DEPTH = 1.6, LAYOUT = 2;           // metres of wall per slot, how far a facade may reach into the hall, the numbering scheme of the records
 const CATS = ['Club', 'Café', 'Arcade', 'Gallery', 'Lounge', 'Spooky', 'Workshop', 'Other'];
 const RULES = ['public', 'holders', 'list'];
 const CAT = rooms.CAT;
@@ -110,6 +111,15 @@ function open(dataDir, opts = {}) {
   const ownsOf = v => (shop && v.addr ? shop.ownsFn(v.addr, v.tier) : undefined);
   const facadeLim = (v, tpl = TEMPLATES[v.tier]) => ({ limit: tpl.facade, size: [Math.min(v.span || 1, 2) * SLOT_M, FACADE_DEPTH], name: v.name, post: keepDoorClear, tier: v.tier, owns: ownsOf(v) });
   const venueLim = v => ({ limit: TEMPLATES[v.tier].pieces + extraOf(v).pieces, size: sizeOf(v), name: v.name, tier: v.tier, venue: true, owns: ownsOf(v) });
+  // venues still at a room size from before the 2026-10-15 enlargement move into their tier's new room on load: the size is updated and the room documents are shifted
+  // (rooms.shiftDoc: every piece keeps its place against the back walls) and re-stored as the server's own refit. A document already stamped with the new size is left alone.
+  const sameSize = (a, b) => !!a && !!b && a[0] === b[0] && a[1] === b[1];
+  for (const v of byOwner.values()) {
+    const t = TEMPLATES[v.tier], old = OLD_SIZES[v.tier]; if (!t || !sameSize(v.size, old) || sameSize(old, t.size)) continue;
+    v.size = t.size; const lim = venueLim(v);
+    for (const st of [docs, docs2]) { const r = st.get(v.addr); if (r && r.doc && !sameSize(r.sz, t.size)) st.put(v.addr, rooms.shiftDoc(r.doc, old, t.size), lim); }
+    persist(v);
+  }
   const archived = addr => { try { return JSON.parse(fs.readFileSync(userDocPath(archDir, addr), 'utf8')); } catch (e) { return null; } };
   const daysLeft = v => (v.state === 'frozen' && v.frozenAt ? Math.max(0, Math.ceil((v.frozenAt + FREEZE_MS - now()) / 86400e3)) : null);
 
@@ -216,7 +226,11 @@ function open(dataDir, opts = {}) {
       const t = TEMPLATES[tier]; if (!t) throw new Error('You need a Chog to open a venue.');
       let v = byOwner.get(addr), recs;
       if (v) { if (tier === v.tier) throw new Error('Your venue already fits your tier.'); recs = { venue: docs.get(addr), venue2: docs2.get(addr), facade: facades.get(addr) }; }
-      else { const a = archived(addr); if (!a) throw new Error('You have no venue yet.'); v = a.meta; recs = a; }
+      else {
+        const a = archived(addr); if (!a) throw new Error('You have no venue yet.'); v = a.meta; recs = a;
+        const old = OLD_SIZES[v.tier], nt = TEMPLATES[v.tier];
+        if (old && nt && sameSize(v.size, old)) { const mv = r => (r && r.doc && !r.sz ? { ...r, doc: rooms.shiftDoc(r.doc, old, nt.size) } : r); recs = { ...a, venue: mv(a.venue), venue2: mv(a.venue2) }; }      // archived before the enlargement
+      }
       writeJson(path.join(backDir, addr + '-' + now() + '.json'), { meta: v, venue: recs.venue, venue2: recs.venue2, facade: recs.facade, at: now() });
       const wasFrozen = v.state === 'frozen', prev = wasFrozen ? v.prevState : v.state, from = { floor: v.floor, levels: v.levels || 1 };
       all.delete(v.id); byOwner.delete(addr);                                       // free the old slot first: a smaller room may take the same door

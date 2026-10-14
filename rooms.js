@@ -11,7 +11,8 @@ const { verifyMessage } = require('ethers');
 const { clean } = require('./filter');
 const CAT = require('./room_catalog.json');
 
-const LIMITS = { pieces: 80, name: 32, text: 24, size: [13, 10], lights: 10, maxAgeMs: 2 * 60e3 };      // free Home: 80 pieces on a 13 x 10 floor (130 m2); a venue gets its tier's room from hotel.js
+const LIMITS = { pieces: 140, name: 32, text: 24, size: [20, 15], lights: 14, maxAgeMs: 2 * 60e3 };      // free Home: 140 pieces on a 20 x 15 floor (300 m2); a venue gets its tier's room from hotel.js
+const LEGACY_HOME = [13, 10];                                                                            // the Home before the 2026-10-15 enlargement (documents saved then are shifted on load)
 const HEX = /^#[0-9a-f]{6}$/i;
 const num = (v, a, b) => Math.max(a, Math.min(b, Math.round((+v || 0) * 100) / 100));
 const text = (raw, max) => clean(String(raw == null ? '' : raw).slice(0, 120)).text.replace(/\[(link|address) removed\]/g, '').trim().slice(0, max);
@@ -46,22 +47,36 @@ function sanitize(doc, limit = LIMITS.pieces, size = LIMITS.size, fallbackName =
   return out;
 }
 
+// A room that grew: the back walls (north z = -D/2, west x = -W/2) and the corner between them stay where the pieces were saved, so every piece keeps its place
+// relative to them (wall pieces stay on their wall, a rug stays that far from the corner). The new room is bigger on the door and south sides.
+function shiftDoc(doc, from, to) {
+  if (!doc) return doc;
+  const dx = (to[0] - from[0]) / -2, dz = (to[1] - from[1]) / -2, r2 = v => Math.round(v * 100) / 100;
+  return { ...doc, pieces: (doc.pieces || []).map(it => ({ ...it, x: r2(it.x + dx), z: r2(it.z + dz) })) };
+}
 const hashOf = doc => crypto.createHash('sha256').update(JSON.stringify(doc)).digest('hex');
 // what the wallet shows when asked to sign: readable, tied to the exact document, valid for two minutes
 const messageFor = (doc, ts, kind = 'room') => `Chog Hotel ${kind}\nSave "${doc.name}" (${doc.pieces.length} pieces).\nThis costs nothing and sends no transaction.\nHash: ${hashOf(doc)}\nTime: ${ts}`;
 
 // ---- storage: one file per wallet (DATA_DIR/<sub>/<address>.json), a small cache in memory per store
 // kind = 'room' | 'venue' | 'facade' (what the wallet is told it signs); lim = { limit, size, name } overrides the free-room budget
-function open(dataDir, sub = 'rooms', kind = 'room') {
+function open(dataDir, sub = 'rooms', kind = 'room', legacySize = sub === 'rooms' ? LEGACY_HOME : null) {
   const dir = path.join(dataDir, sub); fs.mkdirSync(dir, { recursive: true });
   const cache = new Map(), file = addr => path.join(dir, addr + '.json');
   const ok = addr => /^0x[0-9a-f]{40}$/.test(addr);
   const clean_ = (raw, lim = {}) => { const d = sanitize(raw, lim.limit ?? LIMITS.pieces, lim.size ?? LIMITS.size, lim.name ?? 'My Home', { tier: lim.tier, venue: lim.venue, owns: lim.owns }); return lim.post ? lim.post(d) : d; };       // post: a last rule on the cleaned document (the facade keeps its door clear)
+  // a record without `sz` (the floor it was fitted to) was saved at the old size: shift its pieces, keep it as the server's own refit (the wallet's signature covered the old document)
+  const upgrade = (addr, r) => {
+    const doc = clean_(shiftDoc(r.doc, legacySize, LIMITS.size)), now = Date.now(), nr = { addr, doc, hash: hashOf(doc), sig: null, refit: true, ts: now, savedAt: r.savedAt || now, sz: LIMITS.size };
+    try { const tmp = file(addr) + '.tmp'; fs.writeFileSync(tmp, JSON.stringify(nr)); fs.renameSync(tmp, file(addr)); } catch (e) { /* the shifted copy is still served */ }
+    return nr;
+  };
   return {
     get(addr) {
       if (!ok(addr)) return null;
       if (cache.has(addr)) return cache.get(addr);
       let r = null; try { r = JSON.parse(fs.readFileSync(file(addr), 'utf8')); } catch (e) { /* none yet */ }
+      if (r && legacySize && !r.sz) r = upgrade(addr, r);                             // saved before the room grew: shift it once
       if (r) { cache.set(addr, r); if (cache.size > 500) cache.delete(cache.keys().next().value); }
       return r;
     },
@@ -74,14 +89,14 @@ function open(dataDir, sub = 'rooms', kind = 'room') {
       const doc = clean_(raw, lim);
       let who; try { who = verifyMessage(messageFor(doc, ts, kind), String(sig)).toLowerCase(); } catch (e) { throw new Error('That signature is not valid.'); }
       if (who !== addr) throw new Error('That signature is from another wallet.');
-      const rec = { addr, doc, hash: hashOf(doc), sig: String(sig), ts, savedAt: now };
+      const rec = { addr, doc, hash: hashOf(doc), sig: String(sig), ts, savedAt: now, sz: lim && lim.size || LIMITS.size };
       const tmp = file(addr) + '.tmp'; fs.writeFileSync(tmp, JSON.stringify(rec)); fs.renameSync(tmp, file(addr));
       cache.set(addr, rec); return rec;
     },
     // put: the server itself stores a document it refitted (a venue moved to another room size). Not signed by the wallet: `sig` is null and `refit` marks it.
     put(addr, raw, lim, now = Date.now()) {
       if (!ok(addr)) throw new Error('no wallet');
-      const doc = clean_(raw, lim), rec = { addr, doc, hash: hashOf(doc), sig: null, refit: true, ts: now, savedAt: now };
+      const doc = clean_(raw, lim), rec = { addr, doc, hash: hashOf(doc), sig: null, refit: true, ts: now, savedAt: now, sz: lim && lim.size || LIMITS.size };
       const tmp = file(addr) + '.tmp'; fs.writeFileSync(tmp, JSON.stringify(rec)); fs.renameSync(tmp, file(addr));
       cache.set(addr, rec); return rec;
     },
@@ -90,4 +105,4 @@ function open(dataDir, sub = 'rooms', kind = 'room') {
   };
 }
 
-module.exports = { open, sanitize, hashOf, messageFor, LIMITS, CAT };
+module.exports = { open, sanitize, hashOf, messageFor, shiftDoc, LIMITS, LEGACY_HOME, CAT };

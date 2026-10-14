@@ -50,7 +50,7 @@ const CFG = {
   rpc: process.env.RPC_URL || 'https://rpc.monad.xyz',
   nft: (process.env.NFT_ADDR || '0xc96d31f8626c6d03fae5dcd3d61e3fb9f4a73763').toLowerCase(),
   origins: (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean),   // empty = any origin (dev)
-  half: 10.4, limit: 10.4 - 0.45,                 // half size of the town slab and the walkable limit (HALF in prototype/js/world_city.js)
+  half: 32, limit: 32 - 0.45,                   // half size of the town slab and the walkable limit (HALF in prototype/js/world_city.js)
   speed: 2.7, tolerance: 1.6,                     // client walk speed and how much faster than that we still accept
   maxPlayers: +process.env.MAX_PLAYERS || 200, maxPerIp: +process.env.MAX_PER_IP || 6,
   tickMs: 100, pingMs: 20000, sessionMs: 12 * 3600e3,
@@ -68,7 +68,7 @@ const hotel = hotelLib.open(DATA_DIR, { now: () => Date.now() + clock.skew, shop
 const users = usersLib.open(DATA_DIR);
 const [ROOM_W, ROOM_D] = roomsLib.LIMITS.size;
 const ROOM_LIMIT = [ROOM_W / 2 - 0.2, ROOM_D / 2 - 0.2];                         // walking limit on the room floor (the client keeps 0.3 off the walls)
-const HOTEL_LOBBY = [5.3, 3.8], HOTEL_FLOOR = [7.8, 7.8];                         // walking limits in the hotel lobby and on a floor (HOTEL in prototype/js/hotel.js: a 16 x 16 m hall)
+const HOTEL_LOBBY = [8.05, 5.8], HOTEL_FLOOR = [11.8, 11.8];                      // walking limits in the hotel lobby (16.5 x 12 m) and on a floor (a 24 x 24 m hall), 0.2 m inside the walls (HOTEL in prototype/js/hotel.js)
 const venueSpace = (id, level) => 'venue:' + id + (level === 2 ? '#2' : ''), venueIdOf = space => space.slice(6).split('#')[0];      // a venue's upper level is a space of its own (presence and chat per level)
 const limitsOf = space => {
   if (space.startsWith('city')) return [CFG.limit, CFG.limit];

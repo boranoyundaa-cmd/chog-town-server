@@ -32,6 +32,9 @@ function open(dataDir, opts = {}) {
   const file = path.join(dataDir, 'exhibition.json');
   let db = { weeks: {}, results: {}, trophies: {} };                                            // weeks[start] = { key, theme, entries: {addr: entry}, votes: {voter: {id, at}} }
   try { db = Object.assign(db, JSON.parse(fs.readFileSync(file, 'utf8'))); } catch (e) { /* first run */ }
+  { const R = require('./rooms'); let moved = false;                                              // entries snapshotted before the Home grew (13 x 10 -> 20 x 15): shift them once, keep their hash
+    for (const w of Object.values(db.weeks || {})) for (const e of Object.values(w.entries || {})) if (e.doc && !e.sz) { e.doc = R.shiftDoc(e.doc, R.LEGACY_HOME, R.LIMITS.size); e.sz = R.LIMITS.size; moved = true; }
+    if (moved) try { fs.writeFileSync(file + '.tmp', JSON.stringify(db)); fs.renameSync(file + '.tmp', file); } catch (e) { /* retried on the next start */ } }
   const save = () => { const tmp = file + '.tmp'; fs.writeFileSync(tmp, JSON.stringify(db)); fs.renameSync(tmp, file); };
   const weekOf = start => db.weeks[start] || (db.weeks[start] = { key: weekKey(start), theme: themeOf(start), entries: {}, votes: {} });
   const homeOf = addr => { const r = addr && rooms.get(addr); return r && r.doc && r.doc.pieces && r.doc.pieces.length ? r : null; };
@@ -97,7 +100,7 @@ function open(dataDir, opts = {}) {
       if (who !== addr) throw new Error('That signature is from another wallet.');
       const w = weekOf(I.start), old = w.entries[addr], hash = hashOf(h.doc);
       if (old && old.hash !== hash) for (const [voter, v] of Object.entries(w.votes)) if (v.addr === addr) delete w.votes[voter];     // a different Home is a different entry: its votes start again
-      w.entries[addr] = { id: idOf(I.key, addr), addr, name: h.doc.name, by: label(addr), doc: JSON.parse(JSON.stringify(h.doc)), hash, sig: String(sig), ts, at: t, replaced: !!old };
+      w.entries[addr] = { id: idOf(I.key, addr), addr, name: h.doc.name, by: label(addr), doc: JSON.parse(JSON.stringify(h.doc)), sz: h.sz || require('./rooms').LIMITS.size, hash, sig: String(sig), ts, at: t, replaced: !!old };
       save(); return { replaced: !!old, id: w.entries[addr].id };
     },
     prepareVote(addr, id) {
