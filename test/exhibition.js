@@ -1,5 +1,5 @@
 'use strict';
-// The weekly Home contest: theme rotation, submit and replace, deadlines, vote rules, hidden counts, winner and trophy at week end.  Run: node test/exhibition.js (part of npm test)
+// The weekly room contest: theme rotation, submit and replace, deadlines, vote rules, hidden counts, winner and trophy at week end.  Run: node test/exhibition.js (part of npm test)
 const assert = require('assert'), fs = require('fs'), os = require('os'), path = require('path');
 const { Wallet } = require('ethers');
 const roomsLib = require('../rooms'), exLib = require('../exhibition');
@@ -26,7 +26,7 @@ const idOfName = (P, name) => ex.list(P.addr).entries.find(e => e.name === name)
   assert(exLib.THEMES.length >= 12); assert.notEqual(ex.themeOf(MON), ex.themeOf(MON + exLib.WEEK)); assert.equal(ex.themeOf(MON), ex.themeOf(MON + exLib.THEMES.length * exLib.WEEK)); ok('the theme changes every week and the list rotates');
 
   // ---- submit
-  throws(() => ex.prepareSubmit(null), /sign in/); throws(() => ex.prepareSubmit(NOHOME.addr), /Save your Home/); ok('no wallet or no saved Home: no entry');
+  throws(() => ex.prepareSubmit(null), /sign in/); throws(() => ex.prepareSubmit(NOHOME.addr), /Decorate and save your room/); ok('no wallet or no saved Home: no entry');
   await home(A, 'Ann Den'); await home(B, 'Bob Bar'); await home(C, 'Cat Cafe'); await home(D, 'Dan Desk'); await home(E, 'Eve Loft');
   const r1 = ex.prepareSubmit(A.addr); assert(/^Chog Hotel exhibition\nEnter 2026-W42/.test(r1.message)); assert(r1.message.includes('Hash: ')); ok('the message to sign names the week and the exact Home');
   throws(() => ex.submit(A.addr, r1.ts, 'not a signature'), /not valid/);
@@ -43,7 +43,7 @@ const idOfName = (P, name) => ex.list(P.addr).entries.find(e => e.name === name)
   // ---- votes
   const idA = idOfName(A, 'Ann Den v2'), idB = idOfName(B, 'Bob Bar'), idC = idOfName(C, 'Cat Cafe'), idD = idOfName(D, 'Dan Desk'), idE = idOfName(E, 'Eve Loft');
   throws(() => ex.prepareVote(A.addr, idA), /own entry/); ok('voting for yourself is refused');
-  throws(() => ex.prepareVote(null, idA), /sign in/); throws(() => ex.prepareVote(NOHOME.addr, idA), /Save a Home/); throws(() => ex.prepareVote(B.addr, 'nope'), /not in this week/); ok('no wallet, no saved Home, or an unknown entry: no vote');
+  throws(() => ex.prepareVote(null, idA), /sign in/); throws(() => ex.prepareVote(NOHOME.addr, idA), /Decorate and save a room/); throws(() => ex.prepareVote(B.addr, 'nope'), /not in this week/); ok('no wallet, no saved Home, or an unknown entry: no vote');
   const pv = ex.prepareVote(B.addr, idA); throws(() => ex.vote(B.addr, idA, pv.ts, await_sig(C, pv.message)), /another wallet/); ok('a vote needs the voter\'s own signature');
   assert.equal(ex.list(B.addr).entries.every(e => e.votes === null), true); ok('before you voted no count is shown');
   await vote(B, idA); await vote(C, idA); await vote(D, idB); await vote(E, idB); await vote(A, idC);

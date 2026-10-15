@@ -124,9 +124,11 @@ async function sign(c, w, kind, d) { c.got.length = 0; c.send({ t: kind + 'prep'
 
   // Home save: unowned shop pieces dropped, owned kept (a tier 4 wallet that owns the bull)
   await sleep(350); T4.send({ t: 'shopbuy', id: 2, qty: 1 }); await T4.wait(x => x.t === 'shopstate' && x.owned[2] === 1);
-  const sv = await sign(T4, W4, 'room', doc('My Home', full)); assert.equal(sv.t, 'roomsaved');
-  const home = require('../index').CFG && JSON.parse(fs.readFileSync(path.join(process.env.DATA_DIR, 'rooms', W4.address.toLowerCase() + '.json'), 'utf8')); assert.deepEqual(home.doc.pieces.map(p => p.p), ['shopBull', 'sofa']); ok('saving a Home through the server keeps owned shop pieces and drops the unowned ones');
-  await sleep(150); const pr = await sign(T1, W1, 'room', doc('My Home', [{ p: 'shopBull', x: 0, z: 0 }, { p: 'sofa', x: 2, z: 2 }])); assert.equal(pr.t, 'roomsaved'); const home1 = JSON.parse(fs.readFileSync(path.join(process.env.DATA_DIR, 'rooms', W1.address.toLowerCase() + '.json'), 'utf8')); assert.deepEqual(home1.doc.pieces.map(p => p.p), ['sofa']); ok('another wallet that does not own the bull loses it on save');
+  for (const [c, w] of [[T4, W4], [T1, W1]]) { await sleep(150); c.got.length = 0; c.send({ t: 'checkinprep' }); const cp = await c.wait(x => x.t === 'checkinprep'); await sleep(150); c.send({ t: 'checkin', ts: cp.ts, sig: await w.signMessage(cp.message) }); assert((await c.wait(x => x.t === 'checkin')).ok); }
+  const docFile = w => JSON.parse(fs.readFileSync(path.join(process.env.DATA_DIR, 'venue_docs', w.address.toLowerCase() + '.json'), 'utf8'));
+  const sv = await sign(T4, W4, 'venue', doc('My Home', full)); assert.equal(sv.t, 'venuesaved');
+  assert.deepEqual(docFile(W4).doc.pieces.map(p => p.p), ['shopBull', 'sofa']); ok('saving a free room through the server keeps owned shop pieces and drops the unowned ones');
+  await sleep(150); const pr = await sign(T1, W1, 'venue', doc('My Home', [{ p: 'shopBull', x: 0, z: 0 }, { p: 'sofa', x: 2, z: 2 }])); assert.equal(pr.t, 'venuesaved'); assert.deepEqual(docFile(W1).doc.pieces.map(p => p.p), ['sofa']); ok('another wallet that does not own the bull loses it on save');
 
   // venue: extras budget, event, camera, tip announcement
   await sleep(1100); T4.send({ t: 'venuemake', name: 'Skyline', cat: 'Club', desc: 'Top' }); const mk = await T4.wait(x => x.t === 'venuemine'); const base = mk.mine.template.pieces;

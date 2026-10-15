@@ -1,9 +1,9 @@
 'use strict';
-// The weekly Home contest (docs/project/build-plan.md, Exhibition floor). A week runs Monday 00:00 UTC to Sunday 24:00 and has a theme.
-// Entering: a wallet with a saved Home signs "Enter <week>" and the server keeps a snapshot copy of that Home (one entry per wallet per week; it can be replaced until Sunday 12:00 UTC;
-// replacing with a different Home clears the votes it had, so nobody collects votes and then swaps the entry).
-// Voting: one signed vote per wallet per week, never for yourself, movable until Sunday 24:00. Only a wallet with a saved Home (at least one piece) may vote: an empty
-// wallet costs nothing to create, a saved Home needs a signature and some effort. Vote counts are hidden from a player until they voted, and shown to everyone once the week is over.
+// The weekly room contest (docs/project/build-plan.md, Exhibition floor). A week runs Monday 00:00 UTC to Sunday 24:00 and has a theme.
+// Entering: a wallet with a saved room signs "Enter <week>" and the server keeps a snapshot copy of that room (one entry per wallet per week; it can be replaced until Sunday 12:00 UTC;
+// replacing with a different room clears the votes it had, so nobody collects votes and then swaps the entry).
+// Voting: one signed vote per wallet per week, never for yourself, movable until Sunday 24:00. Only a wallet with a saved room (at least one piece) may vote: an empty
+// wallet costs nothing to create, a saved room needs a signature and some effort. Vote counts are hidden from a player until they voted, and shown to everyone once the week is over.
 // Winner: most votes, a tie goes to the EARLIER submission (the time of the last submit or replace); no winner without at least one vote.
 // The winner gets a trophy (kept per wallet here: exposed as `trophies` in ex_list) and heads the next week's Exhibition floor.
 const crypto = require('crypto');
@@ -32,7 +32,7 @@ function open(dataDir, opts = {}) {
   const file = path.join(dataDir, 'exhibition.json');
   let db = { weeks: {}, results: {}, trophies: {} };                                            // weeks[start] = { key, theme, entries: {addr: entry}, votes: {voter: {id, at}} }
   try { db = Object.assign(db, JSON.parse(fs.readFileSync(file, 'utf8'))); } catch (e) { /* first run */ }
-  { const R = require('./rooms'); let moved = false;                                              // entries snapshotted before the Home grew (13 x 10 -> 20 x 15): shift them once, keep their hash
+  { const R = require('./rooms'); let moved = false;                                              // entries snapshotted before the old Home grew (13 x 10 -> 20 x 15): shift them once, keep their hash
     for (const w of Object.values(db.weeks || {})) for (const e of Object.values(w.entries || {})) if (e.doc && !e.sz) { e.doc = R.shiftDoc(e.doc, R.LEGACY_HOME, R.LIMITS.size); e.sz = R.LIMITS.size; moved = true; }
     if (moved) try { fs.writeFileSync(file + '.tmp', JSON.stringify(db)); fs.renameSync(file + '.tmp', file); } catch (e) { /* retried on the next start */ } }
   const save = () => { const tmp = file + '.tmp'; fs.writeFileSync(tmp, JSON.stringify(db)); fs.renameSync(tmp, file); };
@@ -77,29 +77,29 @@ function open(dataDir, opts = {}) {
       const entries = Object.values(w.entries).sort((a, b) => a.at - b.at).map(e => ({ id: e.id, name: e.name, by: e.by, theme: w.theme, votes: voted ? n[e.addr] || 0 : null, mine: e.addr === addr, yours: voted && my.addr === e.addr, at: e.at }));
       const win = winnerEntry();
       return { week: I, entries, winner: win ? { id: win.e.id, name: win.e.name, by: win.e.by, theme: win.week.theme, week: win.week.key, votes: win.votes, winner: true } : null,
-        you: { signedIn: !!addr, entered: !!mine, voted: voted ? my.id : null, eligible: !!addr && eligible(addr), hasHome: !!(addr && homeOf(addr)), canEnter: !!addr && I.submitOpen && !!homeOf(addr) }, trophies: addr ? api.trophies(addr) : [] };
+        you: { signedIn: !!addr, entered: !!mine, voted: voted ? my.id : null, eligible: !!addr && eligible(addr), hasRoom: !!(addr && homeOf(addr)), hasHome: !!(addr && homeOf(addr)), canEnter: !!addr && I.submitOpen && !!homeOf(addr) }, trophies: addr ? api.trophies(addr) : [] };
     },
     // one entry to look at (this week's, or last week's winner); the doc is the snapshot
     view(id) {
       tick(); const cur = weekStart(now());
-      for (const s of [cur, cur - WEEK]) { const w = db.weeks[s]; if (!w) continue; for (const e of Object.values(w.entries)) if (e.id === id) return { id, doc: e.doc, name: e.name, by: e.by, theme: w.theme, week: w.key, at: e.at, current: s === cur, owner: e.addr }; }
+      for (const s of [cur, cur - WEEK]) { const w = db.weeks[s]; if (!w) continue; for (const e of Object.values(w.entries)) if (e.id === id) return { id, doc: e.doc, sz: e.sz || require('./rooms').LIMITS.size, name: e.name, by: e.by, theme: w.theme, week: w.key, at: e.at, current: s === cur, owner: e.addr }; }
       return null;
     },
     prepareSubmit(addr) {
       tick(); const I = info(); if (!addr) throw new Error('Connect and sign in with your wallet to enter the contest.');
       if (!I.submitOpen) throw new Error('Entries for this week closed on Sunday noon (UTC). The next week starts on Monday.');
-      const h = homeOf(addr); if (!h) throw new Error('Save your Home first (with at least one piece), then you can enter the contest.');
+      const h = homeOf(addr); if (!h) throw new Error('Decorate and save your room first (with at least one piece), then you can enter the contest.');
       const ts = now(); return { ts, message: submitMessage(I.key, I.theme, h.doc, ts), n: h.doc.pieces.length };
     },
     submit(addr, ts, sig) {
       tick(); const I = info(), t = now(); if (!addr) throw new Error('Connect and sign in with your wallet to enter the contest.');
       if (!I.submitOpen) throw new Error('Entries for this week closed on Sunday noon (UTC). The next week starts on Monday.');
-      const h = homeOf(addr); if (!h) throw new Error('Save your Home first (with at least one piece), then you can enter the contest.');
+      const h = homeOf(addr); if (!h) throw new Error('Decorate and save your room first (with at least one piece), then you can enter the contest.');
       ts = +ts; if (!Number.isFinite(ts) || Math.abs(t - ts) > MAX_AGE_MS) throw new Error('The signature is too old. Press the button again.');
       let who; try { who = verifyMessage(submitMessage(I.key, I.theme, h.doc, ts), String(sig)).toLowerCase(); } catch (e) { throw new Error('That signature is not valid.'); }
       if (who !== addr) throw new Error('That signature is from another wallet.');
       const w = weekOf(I.start), old = w.entries[addr], hash = hashOf(h.doc);
-      if (old && old.hash !== hash) for (const [voter, v] of Object.entries(w.votes)) if (v.addr === addr) delete w.votes[voter];     // a different Home is a different entry: its votes start again
+      if (old && old.hash !== hash) for (const [voter, v] of Object.entries(w.votes)) if (v.addr === addr) delete w.votes[voter];     // a different room is a different entry: its votes start again
       w.entries[addr] = { id: idOf(I.key, addr), addr, name: h.doc.name, by: label(addr), doc: JSON.parse(JSON.stringify(h.doc)), sz: h.sz || require('./rooms').LIMITS.size, hash, sig: String(sig), ts, at: t, replaced: !!old };
       save(); return { replaced: !!old, id: w.entries[addr].id };
     },
@@ -108,7 +108,7 @@ function open(dataDir, opts = {}) {
       if (!addr) throw new Error('Connect and sign in with your wallet to vote.');
       if (!e) throw new Error('That entry is not in this week\'s contest.');
       if (e.addr === addr) throw new Error('You cannot vote for your own entry.');
-      if (!eligible(addr)) throw new Error('Save a Home of your own first (with at least one piece), then you can vote.');
+      if (!eligible(addr)) throw new Error('Decorate and save a room of your own first (with at least one piece), then you can vote.');
       const ts = now(); return { ts, id, message: voteMessage(I.key, e, ts) };
     },
     vote(addr, id, ts, sig) {
@@ -116,7 +116,7 @@ function open(dataDir, opts = {}) {
       if (!addr) throw new Error('Connect and sign in with your wallet to vote.');
       if (!e) throw new Error('That entry is not in this week\'s contest.');
       if (e.addr === addr) throw new Error('You cannot vote for your own entry.');
-      if (!eligible(addr)) throw new Error('Save a Home of your own first (with at least one piece), then you can vote.');
+      if (!eligible(addr)) throw new Error('Decorate and save a room of your own first (with at least one piece), then you can vote.');
       ts = +ts; if (!Number.isFinite(ts) || Math.abs(t - ts) > MAX_AGE_MS) throw new Error('The signature is too old. Press Vote again.');
       let who; try { who = verifyMessage(voteMessage(I.key, e, ts), String(sig)).toLowerCase(); } catch (x) { throw new Error('That signature is not valid.'); }
       if (who !== addr) throw new Error('That signature is from another wallet.');
