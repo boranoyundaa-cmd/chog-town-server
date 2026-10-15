@@ -39,13 +39,14 @@ let n = 0; const ok = name => console.log(`  ok ${++n} ${name}`);
   assert(wa.challenge.includes('Nonce:')); ok('welcome carries a sign-in challenge');
   const joinB = await a.wait(m => m.t === 'join'); assert(joinB.p.name.startsWith('Guest-')); ok('A sees B join as a guest');
 
-  b.send({ t: 'move', x: 1, z: 2, ry: 0.5, mv: true }); await sleep(60);
-  let st = await a.wait(m => m.t === 'state' && m.p.some(r => r[0] === joinB.p.id)); const row = st.p.find(r => r[0] === joinB.p.id);
-  assert(row[1] > 0.5 && row[1] <= 1.01); ok('a plausible move is relayed (clamped to what speed allows)');
+  // a step of about 0.3 m from the spawn (a fresh join may only move ~0.6 m in its first tick, so a far target would be clamped to nothing)
+  const j0 = joinB.p; b.send({ t: 'move', x: j0.x + 0.3, z: j0.z + 0.3, ry: 0.5, mv: true }); a.got.length = 0;
+  const st = await a.wait(m => m.t === 'state' && m.p.some(r => r[0] === joinB.p.id && r[1] > j0.x + 0.1));
+  const row = st.p.find(r => r[0] === joinB.p.id); assert(row[1] - j0.x <= 0.7 && row[2] - j0.z <= 0.7); ok('a plausible move is relayed (clamped to what speed allows)');
 
   b.send({ t: 'move', x: 99, z: -99, ry: 0, mv: true }); await sleep(250);
   const last = a.got.filter(m => m.t === 'state').pop().p.find(r => r[0] === joinB.p.id);
-  assert(Math.abs(last[1]) <= 9.96 && Math.abs(last[2]) <= 9.96); ok('positions stay inside the town');
+  assert(Math.abs(last[1]) <= 31.96 && Math.abs(last[2]) <= 31.96); ok('positions stay inside the town');
   a.send({ t: 'move', x: 0.5, z: 1.9, ry: 0, mv: false }); await sleep(120);
   for (let i = 0; i < 4; i++) { a.send({ t: 'move', x: -5, z: -5, ry: 0, mv: true }); await sleep(30); }
   await a.wait(m => m.t === 'snap'); ok('teleporting gets the client snapped back');

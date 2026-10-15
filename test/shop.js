@@ -55,7 +55,8 @@ async function sign(c, w, kind, d) { c.got.length = 0; c.send({ t: kind + 'prep'
   eq(ABI.buyWithChog(9, 1), I.encodeFunctionData('buyWithChog', [9, 1])); eq(ABI.buyWithMon(9, 1, ABI.wei(600), 1790000000), I.encodeFunctionData('buyWithMon', [9, 1, 600n * 10n ** 18n, 1790000000]));
   eq(ABI.tip(A2, 401, ABI.wei(500)), I.encodeFunctionData('tip', [A2, 401, 500n * 10n ** 18n])); eq(ABI.router(), I.encodeFunctionData('router')); eq(ABI.slot0(), I.encodeFunctionData('slot0'));
   eq(ABI.balanceOfBatch([A1, A1, A1], [1, 2, 3]), I.encodeFunctionData('balanceOfBatch', [[A1, A1, A1], [1, 2, 3]])); ok('the page\'s ABI encoder matches ethers (approve, buy, tip, router, slot0, balanceOfBatch)');
-  assert(/shop: null/.test(src) && !/shop: '0x/.test(src)); ok('the shop address is null in the page config until deployed');
+  const cliAddr = (src.match(/shop:\s*"(0x[0-9a-fA-F]{40})"/) || [])[1], flyAddr = (fs.readFileSync(path.join(__dirname, '../fly.toml'), 'utf8').match(/SHOP_ADDRESS\s*=\s*"(0x[0-9a-fA-F]{40})"/) || [])[1];
+  assert(cliAddr && flyAddr, 'the page config and fly.toml each name a shop address'); assert.equal(cliAddr.toLowerCase(), flyAddr.toLowerCase()); ok("the page's shop address is the server's SHOP_ADDRESS (fly.toml)");
 
   // ---- ownership from a chain stand-in (balanceOfBatch) and the shop contract address being unset
   const SHOP_AT = '0x' + 'ab'.repeat(20), bal = { [A1.toLowerCase()]: { 9: 1, 17: 1, 18: 1, 20: 2, 21: 1, 2: 1, 8: 1, 19: 5, 22: 3 } };
