@@ -9,6 +9,7 @@ primary_region = "fra"            # Frankfurt: closest Fly region to Turkey
   PORT = "8767"
   DATA_DIR = "/data"                                                      # the mounted volume: saved rooms and reports survive deploys
   ALLOWED_ORIGINS = "https://chog-hotel.pages.dev,https://chog-town.pages.dev,http://localhost:8766"   # the live game page (chog-town only redirects there now) and local dev
+  SHOP_ADDRESS = "0x0eD0D1c8782819Cb9AbFe183C6c0235F248B2F9a"           # the ChogShop contract (must match SHOP_CONFIG.shop in prototype/js/shop.js)
 
 [mounts]
   source = "chog_data"
