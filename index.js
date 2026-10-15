@@ -28,6 +28,9 @@
 //   shopbuy {id, qty} (SHOP_MOCK=1 only)   record a mock purchase;   equip {slot, id|null}   wear or take off a cosmetic in an extra slot (others see it: `cos` in every player record)
 //   eventstart {title, mega?}           announce a 24 h event at your open venue (uses up an Event pass)  ->  events {list} to everybody;  camopen {} / camclose {} -> camera {init, size, pieces} then camera {players} every second (security camera item)
 //   tip {venueId, amount, tx}           tell the venue you tipped its owner (the server checks the Tip event of the transaction)  ->  tipped {name, amount, venue} to everybody inside
+//   phonekey {} -> phonekey {code, exp}  a one-time code for the phone companion (the PC shows it as a QR code; phone.js)
+//   phone connections (ws url ?phone=1) are never in a space anyone sees and may only send: phonepair {code} -> phoneok {key, addr, name} | phonefail {reason};  phoneauth {key} -> phoneauth {ok, addr?, name?};
+//     m_room {} -> m_room {room|null, doc, doc2, camera, inside, today:{visitors, tips}, events}, then m_count {inside, today} when it changes, or camera {players} every second with the security camera;  roomlock {locked}
 //   invite / invlink / roomprep / roomsave / enter {space:'room'}   the old Home messages: answered with a note (rooms are public unless locked; a Home is a Hotel room now)
 // Server -> client: welcome, authed, authfail, appear (full player), join, leave, state, snap, chat, sys, entered, roomfail, roomdoc, enterwait {after}, hotel, counts, kicked {floor},
 //   hotelinfo {floors, basement, rooms, busiest:{door,name,inside}|null, events:[{door,name,title,until}], winner:{name}|null}   to the town on connect, on entering the town and when it changes (at most every 10 s).
@@ -46,6 +49,7 @@ const usersLib = require('./users');
 const gamesLib = require('./games');
 const exhibitionLib = require('./exhibition');
 const shopLib = require('./shop');
+const phoneLib = require('./phone');
 
 const CFG = {
   port: +process.env.PORT || 8767,
@@ -67,6 +71,7 @@ fs.mkdirSync(DATA_DIR, { recursive: true });
 const clock = { skew: 0 };                                                       // tests move time with clock.skew (venue freeze and expiry)
 const shop = shopLib.open(DATA_DIR, { now: () => Date.now() + clock.skew, rpc: CFG.rpc });                  // the shop (shop.js): SHOP_ADDRESS / SHOP_MOCK from the environment
 const users = usersLib.open(DATA_DIR);
+const phone = phoneLib.open(DATA_DIR, { now: () => Date.now() + clock.skew });              // the phone companion: pairing keys and today's numbers per room (phone.js)
 const inventory = inventoryLib.open(DATA_DIR);                                   // pieces that no longer fit a room (inventory.js)
 const hotel = hotelLib.open(DATA_DIR, { now: () => Date.now() + clock.skew, shop, nameOf: users.nameOf, inventory });          // also moves the old Homes into free rooms
 const CHECKIN_IP_MAX = +process.env.CHECKIN_IP_MAX || 5;                          // check-ins per address and day
@@ -215,7 +220,7 @@ function onEnter(p, m) {
     level = +m.level === 2 ? 2 : 1; if (level === 2 && (venue.levels || 1) < 2) return roomFail(p, 'There is no upper level here.');
     const why = hotel.entry(venue, p, { level }); if (why) return roomFail(p, why);
     owner = venue.addr || null; target = venueSpace(venue.id, level); rec = { doc: level === 2 ? venue.doc2 : venue.doc, savedAt: null };
-    hotel.visited(venue.id);
+    hotel.visited(venue.id); if (!p.addr || p.addr !== venue.addr) phone.visit(venue.id, p.addr || 'g' + p.id);          // today's visitors for the owner's phone
   } else return;
   const [lx, lz] = limitsOf(target), x = +m.x, z = +m.z, ry = +m.ry;
   bcast(p.space, { t: 'leave', id: p.id }, p);
@@ -460,7 +465,7 @@ function cameraInit(v) {                                  // the room as flat bo
   return { t: 'camera', init: 1, id: v.id, name: v.name, size: hotel.sizeOf(v), levels: v.levels || 1, pieces: flat(full && full.doc), pieces2: flat(full && full.doc2) };
 }
 function cameraFrame(v) {
-  const list = []; for (const q of players.values()) if (q.space.startsWith('venue:') && venueIdOf(q.space) === v.id) list.push({ id: q.id, name: q.name, x: r2(q.x), z: r2(q.z), l: q.space.endsWith('#2') ? 2 : 1, mv: q.mv ? 1 : 0, owner: q.addr === v.addr ? 1 : 0 });
+  const list = []; for (const q of players.values()) if (q.space.startsWith('venue:') && venueIdOf(q.space) === v.id) list.push({ id: q.id, name: q.name, token: q.token || null, x: r2(q.x), z: r2(q.z), ry: r2(q.ry), l: q.space.endsWith('#2') ? 2 : 1, mv: q.mv ? 1 : 0, owner: q.addr === v.addr ? 1 : 0 });
   return { t: 'camera', players: list, at: now() };
 }
 async function onTip(p, m) {
@@ -469,7 +474,7 @@ async function onTip(p, m) {
   if (!p.space.startsWith('venue:') || venueIdOf(p.space) !== v.id) throw new Error('You tip from inside the venue.');
   const whole = Math.floor(+m.amount); if (!(whole >= 1 && whole <= 10000000)) throw new Error('That is not a valid tip.');
   const wei = await shop.verifyTip(m.tx, { from: p.addr, to: v.addr, venueId: v.no, amount: BigInt(whole) * 10n ** 18n });
-  const amount = Number(BigInt(wei) / 10n ** 18n);
+  const amount = Number(BigInt(wei) / 10n ** 18n); phone.tip(v.id, amount);
   const msg = { t: 'tipped', name: p.name, amount, venue: v.id }; for (const lv of [1, 2]) bcast(venueSpace(v.id, lv), msg);
   for (const q of players.values()) if (q.addr === v.addr && !q.space.startsWith('venue:' + v.id)) send(q, msg);
   log('tip', p.name, '->', v.name, amount);
@@ -492,6 +497,29 @@ function onUsernameSave(p, m) {
 }
 
 // ---------- connection
+// ---------- the phone companion (phone.js): paired with a key from the PC, it reads its own room and may lock it; nothing else
+async function onPhone(p, m) {
+  if (m.t === 'phonepair') {
+    if (++p.pairTries > 6) return send(p, { t: 'phonefail', reason: 'Too many tries. Ask Lev for a new key on your PC.' });
+    const r = phone.pair(m.code); if (!r) return send(p, { t: 'phonefail', reason: 'That key has expired or was already used. Ask Lev for a new one on your PC.' });
+    p.addr = r.addr; p.username = users.nameOf(r.addr); log('phone paired', r.addr); return send(p, { t: 'phoneok', key: r.key, addr: r.addr, name: p.username });
+  }
+  if (m.t === 'phoneauth') { const addr = phone.addrOf(m.key); if (!addr) return send(p, { t: 'phoneauth', ok: false }); p.addr = addr; p.username = users.nameOf(addr); return send(p, { t: 'phoneauth', ok: true, addr, name: p.username }); }
+  if (!p.addr) return send(p, { t: 'phonefail', reason: 'This phone is not paired yet.' });
+  if (m.t === 'roomlock') return onLock(p, m);
+  if (m.t === 'm_room') {
+    const t = now(); if (t - p.lastVenue < CFG.venueMs) return; p.lastVenue = t;
+    const events = shop.activeEvents().map(e => { const v = hotel.get(e.id); return { door: v ? v.no : e.no, name: v ? hotel.nameFor(v) || v.name : e.name, title: e.title, until: e.until }; });
+    const v = hotel.byOwner(p.addr); if (!v) { p.mroom = null; p.cam = null; return send(p, { t: 'm_room', room: null, events }); }
+    await shop.owned(p.addr).catch(() => { }); const camera = !!shop.cameraAllowed(p.addr, v.tier), full = hotel.get(v.id) || v;
+    p.mroom = v.id; p.cam = camera ? v.id : null; p.mlast = null;
+    send(p, { t: 'm_room', room: { id: v.id, no: v.no, tag: v.floor < 0 ? 'B' + (-v.floor) + String(v.unit).padStart(2, '0') : undefined, floor: v.floor, name: hotel.nameFor(v) || v.name, size: hotel.sizeOf(v), levels: v.levels || 1, locked: !!v.locked, state: v.state, tier: v.tier || 0, free: hotel.isFree(v) },
+      doc: full.doc || null, doc2: full.doc2 || null, camera, inside: venueCounts()[v.id] || 0, today: phone.today(v.id), events });
+    if (camera) send(p, cameraFrame(v));
+    return;
+  }
+}
+
 const server = http.createServer((req, res) => {
   if (req.url === '/health') { res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' }); return res.end(JSON.stringify({ ok: true, online: players.size, ...stats })); }
   res.writeHead(404); res.end();
@@ -506,18 +534,21 @@ wss.on('connection', (ws, req) => {
   if ((ipCount.get(ip) || 0) >= CFG.maxPerIp) return ws.close(4002, 'too many connections');
   ipCount.set(ip, (ipCount.get(ip) || 0) + 1);
 
-  const id = nextId++, nonce = crypto.randomBytes(12).toString('hex');
+  const id = nextId++, nonce = crypto.randomBytes(12).toString('hex'), isPhone = /[?&]phone=1(&|$)/.test(req.url || '');        // a phone companion is in nobody's space
   const p = {
     id, ws, ip, nonce, addr: null, token: null, space: 'city', lastEnter: 0, lastPrep: 0, lastSave: 0, lastCheckin: 0, lastVenue: 0, lastShop: 0, cosm: null, cam: null, username: null, guest: 'Guest-' + String(1000 + (id * 7919) % 9000), name: '',
     x: CFG.spawn[0] + (Math.random() - 0.5) * 0.8, z: CFG.spawn[1] + (Math.random() - 0.5) * 0.8, ry: 0.6, mv: false, dirty: false, moveAt: now(), strikes: 0,
     chatTimes: [], lastText: '', lastAt: 0, mutedUntil: 0, reports: [], lastReport: 0, alive: true, authBusy: false,
   };
   p.name = p.guest; players.set(id, p); stats.connected++;
+  if (isPhone) { p.phone = true; p.space = 'phone:' + id; p.pairTries = 0; send(p, { t: 'welcome', id, phone: 1 }); log('phone', `(${players.size} online)`); }
+  else {
   send(p, { t: 'welcome', id, name: p.name, challenge: challengeText(nonce), players: [...players.values()].filter(q => q !== p && q.space === 'city').map(pub), you: pub(p), maxChat: CFG.chatMax, rooms: 1, hotel: 1, shop: shop.info() });
   send(p, { t: 'events', list: shop.activeEvents() });
   send(p, hotelInfo());
   bcast('city', { t: 'join', p: pub(p) }, p);
   log('join', p.name, `(${players.size} online)`);
+  }
 
   ws.on('pong', () => { p.alive = true; });
   ws.on('message', async data => {
@@ -525,7 +556,9 @@ wss.on('connection', (ws, req) => {
     if (!m || typeof m.t !== 'string') return;
     if (data.length > 2048 && !['roomprep', 'roomsave', 'venueprep', 'venuesave', 'facadeprep', 'facadesave'].includes(m.t)) return;
     try {
+      if (p.phone) return await onPhone(p, m);
       if (m.t === 'move') return onMove(p, m);
+      if (m.t === 'phonekey') { if (!p.addr) return roomFail(p, 'Connect and sign in with your wallet first.'); return send(p, { t: 'phonekey', ...phone.code(p.addr) }); }
       if (m.t.startsWith('g_') && games.onMessage(p, m)) return;
       if (m.t.startsWith('ex_') && exhibition.onMessage(p, m, send)) return;
       if (m.t === 'chat') return onChat(p, m.text);
@@ -584,7 +617,7 @@ wss.on('connection', (ws, req) => {
   ws.on('close', () => {
     games.leave(p);     players.delete(id); if (p.token && byToken.get(p.token) === p) byToken.delete(p.token);
     const n = (ipCount.get(ip) || 1) - 1; if (n > 0) ipCount.set(ip, n); else ipCount.delete(ip);
-    bcast(p.space, { t: 'leave', id }); log('leave', p.name, `(${players.size} online)`);
+    if (!p.phone) { bcast(p.space, { t: 'leave', id }); log('leave', p.name, `(${players.size} online)`); }
   });
   ws.on('error', () => { });
 });
@@ -600,6 +633,7 @@ setInterval(() => {                                    // who is inside which ho
   for (const p of players.values()) if (p.space.startsWith('hotel:')) send(p, { t: 'counts', c });
 }, 2000);
 setInterval(() => { if (shop.sweepEvents()) { evPush(); hotelPush(); } }, 20000).unref();     // an event that ended leaves the banner and the directory
+setInterval(() => { const c = venueCounts(); for (const p of players.values()) if (p.phone && p.mroom && !p.cam) { const n = c[p.mroom] || 0, d = phone.today(p.mroom), k = n + '/' + d.visitors + '/' + d.tips; if (k !== p.mlast) { p.mlast = k; send(p, { t: 'm_count', inside: n, today: d }); } } }, 1000).unref();      // the phone without a camera: the head count and today's numbers when they change
 setInterval(() => { for (const p of players.values()) if (p.cam) { const v = hotel.byOwner(p.addr); if (!v || v.id !== p.cam) { p.cam = null; continue; } send(p, cameraFrame(v)); } }, 1000).unref();      // security camera: who is where in the venue, once a second
 setInterval(() => hotelInfoPush(false), CFG.infoMs).unref();                       // the town signs: pushed when the numbers changed, at most every 10 s
 sweepBasement(); setInterval(sweepBasement, 24 * 3600e3).unref();              // free rooms nobody entered for 30 days go to the basement: at the start and every day
