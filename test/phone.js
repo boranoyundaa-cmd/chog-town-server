@@ -1,12 +1,12 @@
 'use strict';
-// The phone companion: a pairing code from the signed-in PC, the key the phone keeps, its room, live numbers, the lock, and that a phone is invisible and can do nothing else.  Run: node test/phone.js (part of npm test)
+// The phone companion: a pairing code from the signed-in PC, the key the phone keeps, its room, live numbers, the lock, that a phone is invisible and can do nothing else, and Lev's notifications.  Run: node test/phone.js (part of npm test)
 process.env.PORT = '18787'; process.env.ROOM_PREP_MS = '50'; process.env.ROOM_SAVE_MS = '50'; process.env.VENUE_MS = '60'; process.env.MAX_PER_IP = '40';
 process.env.DATA_DIR = require('path').join(require('os').tmpdir(), 'chog-phone-' + process.pid);
-process.env.RPC_URL = 'http://127.0.0.1:1';                // no chain: a free room needs none
+process.env.RPC_URL = 'http://127.0.0.1:1'; process.env.PUSH_FAKE = '1';                // no chain: a free room needs none
 const assert = require('assert');
 const WebSocket = require('ws');
 const { Wallet } = require('ethers');
-const { server } = require('../index');
+const { server, clock, push, pushSent } = require('../index');
 const URL = 'ws://127.0.0.1:' + process.env.PORT;
 function client(phone) {
   const ws = new WebSocket(URL + (phone ? '/?phone=1' : '')), c = { ws, got: [], send: m => ws.send(JSON.stringify(m)), waiters: [] };
@@ -59,6 +59,27 @@ async function login(w) { const c = client(); await c.open; const wc = await c.w
 
   const keys = []; for (let i = 0; i < 3; i++) { pc.got.length = 0; pc.send({ t: 'phonekey' }); const k = await pc.wait(m => m.t === 'phonekey'); const q = client(true); await q.open; await q.wait(m => m.t === 'welcome'); q.send({ t: 'phonepair', code: k.code }); keys.push((await q.wait(m => m.t === 'phoneok')).key); q.ws.close(); }
   const ph4 = client(true); await ph4.open; await ph4.wait(m => m.t === 'welcome'); ph4.send({ t: 'phoneauth', key: po.key }); assert.equal((await ph4.wait(m => m.t === 'phoneauth')).ok, false); ok('a wallet keeps 3 phone keys: a fourth pairing retires the oldest');
+
+  // Lev's notifications (push.js, PUSH_FAKE collects them)
+  ph3.got.length = 0; ph3.send({ t: 'push_key' }); assert.equal(typeof (await ph3.wait(m => m.t === 'push_key')).key, 'string'); ok('the phone gets the push key of the server');
+  const SUB = { endpoint: 'https://push.test/a', keys: { p256dh: 'p'.repeat(40), auth: 'a'.repeat(16) } };
+  ph3.send({ t: 'push_sub', sub: { endpoint: 'http://evil/x', keys: SUB.keys } }); await ph3.wait(m => m.t === 'phonefail' && /subscription/.test(m.reason)); ok('a subscription that is not https is refused');
+  ph3.got.length = 0; ph3.send({ t: 'push_sub', sub: SUB }); const ps = await ph3.wait(m => m.t === 'push'); assert(ps.on && ps.prefs.visit && ps.prefs.tip); ok('the phone subscribes: visits and tips on');
+  await sleep(100); ph3.got.length = 0; ph3.send({ t: 'roomlock', locked: false }); await ph3.wait(m => m.t === 'lock');
+  const walkIn = async () => { const c = await login(Wallet.createRandom()); c.send({ t: 'enter', space: 'venue', id: mr.room.id, x: 0, z: 0, ry: 0 }); await c.wait(m => m.t === 'entered'); await sleep(120); c.ws.close(); };
+  await walkIn(); assert.equal(pushSent.length, 0); ok('no visit notice while the owner is at the PC');
+  pc.ws.close(); await sleep(150); await walkIn(); assert.equal(pushSent.length, 1); assert(pushSent[0].kind === 'visit' && pushSent[0].body.includes(String(mr.room.no)) && !pushSent[0].body.includes('*stamp*')); ok('the owner away: Lev rings the phone about the visitor (room number, no stamp marker)');
+  await walkIn(); assert.equal(pushSent.length, 1); ok('a second visitor within 30 minutes rings nothing');
+  clock.skew += 31 * 60e3; await walkIn(); assert.equal(pushSent.length, 2); ok('after 30 minutes the next visitor rings again');
+  ph3.got.length = 0; ph3.send({ t: 'push_prefs', endpoint: SUB.endpoint, prefs: { visit: false, tip: true } }); assert.equal((await ph3.wait(m => m.t === 'push')).prefs.visit, false);
+  clock.skew += 31 * 60e3; await walkIn(); assert.equal(pushSent.length, 2); ok('visit notices off: nothing');
+  ph3.got.length = 0; ph3.send({ t: 'push_remind', endpoint: SUB.endpoint, at: Date.now() + clock.skew + 60e3 }); assert((await ph3.wait(m => m.t === 'push')).remind > 0);
+  assert.equal(await push.tick(), 0); clock.skew += 61e3; assert.equal(await push.tick(), 1); assert.equal(pushSent[2].kind, 'remind'); assert.equal(await push.tick(), 0); ok('a reminder rings once, when it is due');
+  ph3.got.length = 0; ph3.send({ t: 'push_remind', endpoint: SUB.endpoint, at: Date.now() + clock.skew + 5 * 86400e3 }); assert.equal((await ph3.wait(m => m.t === 'push')).remind, null); ok('a reminder more than 2 days ahead is refused');
+  const GONE = { endpoint: 'https://push.test/gone', keys: SUB.keys }; ph3.got.length = 0; ph3.send({ t: 'push_sub', sub: GONE }); await ph3.wait(m => m.t === 'push');
+  ph3.got.length = 0; ph3.send({ t: 'push_remind', endpoint: GONE.endpoint, at: Date.now() + clock.skew + 1000 }); await ph3.wait(m => m.t === 'push'); clock.skew += 2000; await push.tick();
+  ph3.got.length = 0; ph3.send({ t: 'push_state', endpoint: GONE.endpoint }); assert.equal((await ph3.wait(m => m.t === 'push')).on, false); ok('a subscription the push service calls gone is dropped');
+  ph3.got.length = 0; ph3.send({ t: 'push_unsub', endpoint: SUB.endpoint }); assert.equal((await ph3.wait(m => m.t === 'push')).on, false); ok('the phone turns notifications off');
 
   for (const c of [pc, town, guestPc, ph, ph2, ph3, ph4, vis, late]) c.ws.close();
   console.log(`\nall ${n} phone checks passed`); server.close(); require('fs').rmSync(process.env.DATA_DIR, { recursive: true, force: true }); process.exit(0);

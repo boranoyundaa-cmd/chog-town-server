@@ -31,6 +31,7 @@
 //   phonekey {} -> phonekey {code, exp}  a one-time code for the phone companion (the PC shows it as a QR code; phone.js)
 //   phone connections (ws url ?phone=1) are never in a space anyone sees and may only send: phonepair {code} -> phoneok {key, addr, name} | phonefail {reason};  phoneauth {key} -> phoneauth {ok, addr?, name?};
 //     m_room {} -> m_room {room|null, doc, doc2, camera, inside, today:{visitors, tips}, events}, then m_count {inside, today} when it changes, or camera {players} every second with the security camera;  roomlock {locked}
+//     push_key {} -> push_key {key};  push_sub {sub, prefs} / push_state {endpoint} / push_prefs {endpoint, prefs} / push_remind {endpoint, at} / push_unsub {endpoint} -> push {on, prefs?, remind?}   Lev's notifications (push.js): a visit (at most every 30 min), a tip, a reminder
 //   invite / invlink / roomprep / roomsave / enter {space:'room'}   the old Home messages: answered with a note (rooms are public unless locked; a Home is a Hotel room now)
 // Server -> client: welcome, authed, authfail, appear (full player), join, leave, state, snap, chat, sys, entered, roomfail, roomdoc, enterwait {after}, hotel, counts, kicked {floor},
 //   hotelinfo {floors, basement, rooms, busiest:{door,name,inside}|null, events:[{door,name,title,until}], winner:{name}|null}   to the town on connect, on entering the town and when it changes (at most every 10 s).
@@ -50,6 +51,7 @@ const gamesLib = require('./games');
 const exhibitionLib = require('./exhibition');
 const shopLib = require('./shop');
 const phoneLib = require('./phone');
+const pushLib = require('./push');
 
 const CFG = {
   port: +process.env.PORT || 8767,
@@ -72,6 +74,8 @@ const clock = { skew: 0 };                                                      
 const shop = shopLib.open(DATA_DIR, { now: () => Date.now() + clock.skew, rpc: CFG.rpc });                  // the shop (shop.js): SHOP_ADDRESS / SHOP_MOCK from the environment
 const users = usersLib.open(DATA_DIR);
 const phone = phoneLib.open(DATA_DIR, { now: () => Date.now() + clock.skew });              // the phone companion: pairing keys and today's numbers per room (phone.js)
+const pushSent = [];                                                                       // PUSH_FAKE=1 (tests): notifications are collected here instead of sent; an endpoint containing 'gone' answers 410
+const push = pushLib.open(DATA_DIR, { now: () => Date.now() + clock.skew, log: (...a) => console.log(...a), sender: process.env.PUSH_FAKE === '1' ? async (sub, body) => { if (sub.endpoint.includes('gone')) { const e = new Error('gone'); e.statusCode = 410; throw e; } pushSent.push({ endpoint: sub.endpoint, ...JSON.parse(body) }); } : null });      // Lev's phone notifications (push.js)
 const inventory = inventoryLib.open(DATA_DIR);                                   // pieces that no longer fit a room (inventory.js)
 const hotel = hotelLib.open(DATA_DIR, { now: () => Date.now() + clock.skew, shop, nameOf: users.nameOf, inventory });          // also moves the old Homes into free rooms
 const CHECKIN_IP_MAX = +process.env.CHECKIN_IP_MAX || 5;                          // check-ins per address and day
@@ -220,7 +224,8 @@ function onEnter(p, m) {
     level = +m.level === 2 ? 2 : 1; if (level === 2 && (venue.levels || 1) < 2) return roomFail(p, 'There is no upper level here.');
     const why = hotel.entry(venue, p, { level }); if (why) return roomFail(p, why);
     owner = venue.addr || null; target = venueSpace(venue.id, level); rec = { doc: level === 2 ? venue.doc2 : venue.doc, savedAt: null };
-    hotel.visited(venue.id); if (!p.addr || p.addr !== venue.addr) phone.visit(venue.id, p.addr || 'g' + p.id);          // today's visitors for the owner's phone
+    hotel.visited(venue.id); if (!p.addr || p.addr !== venue.addr) { phone.visit(venue.id, p.addr || 'g' + p.id);          // today's visitors for the owner's phone
+      if (venue.addr && ![...players.values()].some(q => q.addr === venue.addr && !q.phone)) { const r = push.visit(venue.addr, venue.floor < 0 ? 'B' + (-venue.floor) + String(venue.unit).padStart(2, '0') : venue.no); if (r) r.catch(() => { }); } }          // the owner is away from the PC: Lev rings the phone
   } else return;
   const [lx, lz] = limitsOf(target), x = +m.x, z = +m.z, ry = +m.ry;
   bcast(p.space, { t: 'leave', id: p.id }, p);
@@ -474,7 +479,7 @@ async function onTip(p, m) {
   if (!p.space.startsWith('venue:') || venueIdOf(p.space) !== v.id) throw new Error('You tip from inside the venue.');
   const whole = Math.floor(+m.amount); if (!(whole >= 1 && whole <= 10000000)) throw new Error('That is not a valid tip.');
   const wei = await shop.verifyTip(m.tx, { from: p.addr, to: v.addr, venueId: v.no, amount: BigInt(whole) * 10n ** 18n });
-  const amount = Number(BigInt(wei) / 10n ** 18n); phone.tip(v.id, amount);
+  const amount = Number(BigInt(wei) / 10n ** 18n); phone.tip(v.id, amount); { const r = push.tip(v.addr, amount, p.name); if (r) r.catch(() => { }); }
   const msg = { t: 'tipped', name: p.name, amount, venue: v.id }; for (const lv of [1, 2]) bcast(venueSpace(v.id, lv), msg);
   for (const q of players.values()) if (q.addr === v.addr && !q.space.startsWith('venue:' + v.id)) send(q, msg);
   log('tip', p.name, '->', v.name, amount);
@@ -507,6 +512,15 @@ async function onPhone(p, m) {
   if (m.t === 'phoneauth') { const addr = phone.addrOf(m.key); if (!addr) return send(p, { t: 'phoneauth', ok: false }); p.addr = addr; p.username = users.nameOf(addr); return send(p, { t: 'phoneauth', ok: true, addr, name: p.username }); }
   if (!p.addr) return send(p, { t: 'phonefail', reason: 'This phone is not paired yet.' });
   if (m.t === 'roomlock') return onLock(p, m);
+  if (m.t === 'push_key') return send(p, { t: 'push_key', key: push.publicKey });
+  if (m.t.startsWith('push_')) {
+    const ep = m.sub && m.sub.endpoint || String(m.endpoint || '');
+    if (m.t === 'push_sub') { if (!push.subscribe(p.addr, m.sub, m.prefs)) return send(p, { t: 'phonefail', reason: 'That notification subscription is not valid.' }); log('push on', p.addr); }
+    else if (m.t === 'push_unsub') push.unsubscribe(p.addr, ep);
+    else if (m.t === 'push_prefs') push.prefs(p.addr, ep, m.prefs);
+    else if (m.t === 'push_remind') push.remind(p.addr, ep, m.at);
+    return send(p, { t: 'push', ...push.state(p.addr, ep) });
+  }
   if (m.t === 'm_room') {
     const t = now(); if (t - p.lastVenue < CFG.venueMs) return; p.lastVenue = t;
     const events = shop.activeEvents().map(e => { const v = hotel.get(e.id); return { door: v ? v.no : e.no, name: v ? hotel.nameFor(v) || v.name : e.name, title: e.title, until: e.until }; });
@@ -635,6 +649,7 @@ setInterval(() => {                                    // who is inside which ho
 setInterval(() => { if (shop.sweepEvents()) { evPush(); hotelPush(); } }, 20000).unref();     // an event that ended leaves the banner and the directory
 setInterval(() => { const c = venueCounts(); for (const p of players.values()) if (p.phone && p.mroom && !p.cam) { const n = c[p.mroom] || 0, d = phone.today(p.mroom), k = n + '/' + d.visitors + '/' + d.tips; if (k !== p.mlast) { p.mlast = k; send(p, { t: 'm_count', inside: n, today: d }); } } }, 1000).unref();      // the phone without a camera: the head count and today's numbers when they change
 setInterval(() => { for (const p of players.values()) if (p.cam) { const v = hotel.byOwner(p.addr); if (!v || v.id !== p.cam) { p.cam = null; continue; } send(p, cameraFrame(v)); } }, 1000).unref();      // security camera: who is where in the venue, once a second
+setInterval(() => { push.tick().catch(e => log('push tick failed', e.message)); }, 30000).unref();          // Lev's reminders that are due
 setInterval(() => hotelInfoPush(false), CFG.infoMs).unref();                       // the town signs: pushed when the numbers changed, at most every 10 s
 sweepBasement(); setInterval(sweepBasement, 24 * 3600e3).unref();              // free rooms nobody entered for 30 days go to the basement: at the start and every day
 const SWEEP_MS = +process.env.VENUE_SWEEP_MS || 6 * 3600e3;
@@ -645,4 +660,4 @@ setInterval(() => {                                    // drop dead sockets, exp
 }, CFG.pingMs);
 
 if (require.main === module) server.listen(CFG.port, () => log(`Chog Hotel server on :${CFG.port}  (rpc ${CFG.rpc})`));
-module.exports = { server, wss, CFG, challengeText, clock, hotel, sweepVenues, sweepBasement, hotelInfo, shop, inventory, exhibition, checkins };
+module.exports = { server, wss, CFG, challengeText, clock, push, pushSent, hotel, sweepVenues, sweepBasement, hotelInfo, shop, inventory, exhibition, checkins };
